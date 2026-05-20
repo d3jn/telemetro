@@ -6,16 +6,20 @@ Top bar: two "Load sample" buttons each paired with a lap dropdown, and a
 
 import sys
 
+import numpy as np
 import pandas as pd
+import pyqtgraph as pg
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
-    QFrame,
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -119,9 +123,112 @@ class MainWindow(QMainWindow):
 
         root.addLayout(top)
 
-        self.chart_area = QFrame()
-        self.chart_area.setFrameShape(QFrame.Shape.StyledPanel)
-        root.addWidget(self.chart_area, 1)
+        pg.setConfigOptions(antialias=True)
+        self.plot_widget = pg.PlotWidget(background="w")
+        plot_item = self.plot_widget.getPlotItem()
+        plot_item.setLabel("bottom", "Lap distance (m)")
+        plot_item.setLabel("left", "Inputs")
+        plot_item.showGrid(x=True, y=True, alpha=0.3)
+        plot_item.setYRange(0, 110, padding=0)
+        vb = plot_item.getViewBox()
+        vb.setMouseEnabled(x=True, y=False)
+        vb.setLimits(yMin=0, yMax=110)
+        y_axis = plot_item.getAxis("left")
+        y_axis.setTicks([[(v, str(v)) for v in (0, 20, 40, 60, 80, 100)], []])
+        root.addWidget(self.plot_widget, 1)
+
+        self._samples = {1: None, 2: None}
+
+        self._hover_proxy = pg.SignalProxy(
+            self.plot_widget.scene().sigMouseMoved,
+            rateLimit=60,
+            slot=self._on_mouse_move,
+        )
+
+        self.render_btn.clicked.connect(self._on_render)
+
+    @staticmethod
+    def _extract_lap(sample):
+        df = sample._df
+        lap = sample.lap_combo.currentData()
+        if df is None or lap is None:
+            return None
+        lap_df = df[(df["lap_num"] == lap) & (df["lap_distance"] >= 0)]
+        lap_df = lap_df.sort_values("lap_distance")
+        if lap_df.empty:
+            return None
+        return (
+            lap_df["lap_distance"].to_numpy(),
+            lap_df["throttle"].to_numpy(),
+            lap_df["brake"].to_numpy(),
+        )
+
+    def _on_render(self):
+        self._samples = {
+            1: self._extract_lap(self.sample1),
+            2: self._extract_lap(self.sample2),
+        }
+
+        plot_item = self.plot_widget.getPlotItem()
+        plot_item.clear()
+
+        pens = {
+            (1, "throttle"): pg.mkPen("g", width=3),
+            (1, "brake"): pg.mkPen("r", width=3),
+            (2, "throttle"): pg.mkPen(
+                (144, 238, 144), width=3, style=Qt.PenStyle.DashLine
+            ),
+            (2, "brake"): pg.mkPen(
+                (240, 128, 128), width=3, style=Qt.PenStyle.DashLine
+            ),
+        }
+
+        # Draw sample 2 first so sample 1's solid lines land on top.
+        for sample_num in (2, 1):
+            data = self._samples[sample_num]
+            if data is None:
+                continue
+            x, throttle, brake = data
+            plot_item.plot(x, throttle, pen=pens[(sample_num, "throttle")])
+            plot_item.plot(x, brake, pen=pens[(sample_num, "brake")])
+
+        xs = [d[0] for d in self._samples.values() if d is not None]
+        if not xs:
+            return
+        x_min = min(float(a.min()) for a in xs)
+        x_max = max(float(a.max()) for a in xs)
+
+        plot_item.getViewBox().setLimits(xMin=x_min, xMax=x_max)
+        plot_item.setXRange(x_min, x_max, padding=0)
+        plot_item.setYRange(0, 110, padding=0)
+
+    def _on_mouse_move(self, event):
+        loaded = {n: d for n, d in self._samples.items() if d is not None}
+        if not loaded:
+            QToolTip.hideText()
+            return
+        pos = event[0]
+        vb = self.plot_widget.getPlotItem().getViewBox()
+        if not vb.sceneBoundingRect().contains(pos):
+            QToolTip.hideText()
+            return
+        x_val = vb.mapSceneToView(pos).x()
+
+        show_label = len(loaded) > 1
+        lines = []
+        for sample_num, (x, throttle, brake) in loaded.items():
+            if x_val < x[0] or x_val > x[-1]:
+                continue
+            t_val = float(np.interp(x_val, x, throttle))
+            b_val = float(np.interp(x_val, x, brake))
+            suffix = f" {sample_num}" if show_label else ""
+            lines.append(f"Throttle{suffix}: {t_val:.0f}")
+            lines.append(f"Brake{suffix}: {b_val:.0f}")
+
+        if not lines:
+            QToolTip.hideText()
+            return
+        QToolTip.showText(QCursor.pos(), "\n".join(lines), self.plot_widget)
 
 
 def main():

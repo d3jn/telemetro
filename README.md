@@ -4,14 +4,14 @@
 
 - Python 3.10+
 - `python3-venv` (Debian/Ubuntu: `sudo apt install python3.12-venv`)
-- Python packages: `PySide6`, `pandas`
+- Python packages: `PySide6`, `pandas`, `pyqtgraph`
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install PySide6 pandas
+.venv/bin/pip install PySide6 pandas pyqtgraph
 ```
 
 ## Run
