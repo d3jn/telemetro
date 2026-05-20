@@ -118,6 +118,7 @@ class ChartPanel(QWidget):
     ):
         super().__init__(parent)
         self._series = []
+        self._x_linked = []  # other panels sharing this panel's X axis
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -165,6 +166,14 @@ class ChartPanel(QWidget):
         )
 
     def set_x_range(self, x_min, x_max):
+        # Setting X limits on a viewbox only constrains *that* viewbox — even
+        # when X is linked via setXLink, panning/zooming the other panel
+        # interacts with its own viewbox first. So propagate to every panel
+        # sharing this X axis.
+        for panel in [self, *self._x_linked]:
+            panel._apply_x_range(x_min, x_max)
+
+    def _apply_x_range(self, x_min, x_max):
         vb = self.plot_item.getViewBox()
         vb.setLimits(xMin=x_min, xMax=x_max)
         self.plot_item.setXRange(x_min, x_max, padding=0)
@@ -176,6 +185,14 @@ class ChartPanel(QWidget):
 
     def link_x_to(self, other):
         self.plot_item.setXLink(other.plot_item)
+        # Merge into a flat group: every member lists the others, so any
+        # future set_x_range call reaches all of them.
+        group = []
+        for panel in [self, other, *self._x_linked, *other._x_linked]:
+            if panel not in group:
+                group.append(panel)
+        for panel in group:
+            panel._x_linked = [p for p in group if p is not panel]
 
     def _on_mouse_move(self, event):
         if not self._series:
@@ -248,15 +265,30 @@ class MainWindow(QMainWindow):
             y_label="Inputs",
             y_range=(0, 110),
             y_ticks=[(v, str(v)) for v in (0, 20, 40, 60, 80, 100)],
+        )
+        self.speed_panel = ChartPanel(
+            y_label="Speed (km/h)",
+            y_range=(0, 350),  # placeholder; set per-render from data
+        )
+        self.ers_panel = ChartPanel(
+            y_label="ERS",
+            y_range=(0, 110),
+            y_ticks=[(v, str(v)) for v in (0, 20, 40, 60, 80, 100)],
             x_label="Lap distance (m)",
         )
         self.delta_panel.link_x_to(self.input_panel)
+        self.speed_panel.link_x_to(self.input_panel)
+        self.ers_panel.link_x_to(self.input_panel)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self.delta_panel)
         splitter.addWidget(self.input_panel)
+        splitter.addWidget(self.speed_panel)
+        splitter.addWidget(self.ers_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(2, 2)
+        splitter.setStretchFactor(3, 2)
         root.addWidget(splitter, 1)
 
         self.delta_panel.setVisible(False)
@@ -279,7 +311,49 @@ class MainWindow(QMainWindow):
             "throttle": lap_df["throttle"].to_numpy(),
             "brake": lap_df["brake"].to_numpy(),
             "lap_time": lap_df["lap_time"].to_numpy(),
+            "ers_pct": lap_df["ers_pct"].to_numpy(),
+            "ers_mode": lap_df["ers_mode"].to_numpy(),
+            "speed": lap_df["speed"].to_numpy(),
         }
+
+    def _add_ers_series(self, sample_num, data, ers_pens):
+        """Plot ERS storage as connected segments coloured by ERS mode.
+
+        Each run of consecutive identical-mode samples becomes one series.
+        Adjacent runs share their boundary point so the line stays visually
+        unbroken across mode transitions.
+        """
+        x = data["x"]
+        ers_pct = data["ers_pct"]
+        ers_mode = data["ers_mode"]
+
+        mask = ~np.isnan(ers_pct) & ~np.isnan(ers_mode)
+        if not mask.any():
+            return
+        x = x[mask]
+        ers_pct = ers_pct[mask]
+        ers_mode = ers_mode[mask].astype(int)
+
+        default_pen = ers_pens[(sample_num, 0)]
+
+        def _emit(start, stop):
+            mode = int(ers_mode[start])
+            pen = ers_pens.get((sample_num, mode), default_pen)
+            self.ers_panel.add_series(
+                x[start:stop],
+                ers_pct[start:stop],
+                pen=pen,
+                label="ERS",
+                sample_num=sample_num,
+            )
+
+        start = 0
+        n = len(x)
+        for i in range(1, n):
+            if ers_mode[i] != ers_mode[i - 1]:
+                _emit(start, i + 1)  # include transition point in old segment
+                start = i
+        _emit(start, n)
 
     def _on_render(self):
         self._samples = {
@@ -289,8 +363,10 @@ class MainWindow(QMainWindow):
 
         self.input_panel.clear()
         self.delta_panel.clear()
+        self.speed_panel.clear()
+        self.ers_panel.clear()
 
-        pens = {
+        input_pens = {
             (1, "throttle"): pg.mkPen("g", width=3),
             (1, "brake"): pg.mkPen("r", width=3),
             (2, "throttle"): pg.mkPen(
@@ -299,6 +375,21 @@ class MainWindow(QMainWindow):
             (2, "brake"): pg.mkPen(
                 (240, 128, 128), width=3, style=Qt.PenStyle.DashLine
             ),
+        }
+        speed_pens = {
+            1: pg.mkPen("b", width=3),
+            2: pg.mkPen((100, 150, 240), width=3, style=Qt.PenStyle.DashLine),
+        }
+        # (sample_num, ers_mode) → pen. modes: 0=none, 1=medium, 2=hotlap, 3=overtake.
+        ers_pens = {
+            (1, 0): pg.mkPen((128, 128, 128), width=3),
+            (1, 1): pg.mkPen((0, 180, 0), width=3),
+            (1, 2): pg.mkPen((255, 140, 0), width=3),
+            (1, 3): pg.mkPen((220, 20, 20), width=3),
+            (2, 0): pg.mkPen((180, 180, 180), width=3, style=Qt.PenStyle.DashLine),
+            (2, 1): pg.mkPen((144, 238, 144), width=3, style=Qt.PenStyle.DashLine),
+            (2, 2): pg.mkPen((255, 200, 140), width=3, style=Qt.PenStyle.DashLine),
+            (2, 3): pg.mkPen((240, 128, 128), width=3, style=Qt.PenStyle.DashLine),
         }
 
         # Draw sample 2 first so sample 1's solid lines land on top.
@@ -309,17 +400,25 @@ class MainWindow(QMainWindow):
             self.input_panel.add_series(
                 data["x"],
                 data["throttle"],
-                pen=pens[(sample_num, "throttle")],
+                pen=input_pens[(sample_num, "throttle")],
                 label="Throttle",
                 sample_num=sample_num,
             )
             self.input_panel.add_series(
                 data["x"],
                 data["brake"],
-                pen=pens[(sample_num, "brake")],
+                pen=input_pens[(sample_num, "brake")],
                 label="Brake",
                 sample_num=sample_num,
             )
+            self.speed_panel.add_series(
+                data["x"],
+                data["speed"],
+                pen=speed_pens[sample_num],
+                label="Speed",
+                sample_num=sample_num,
+            )
+            self._add_ers_series(sample_num, data, ers_pens)
 
         xs = [d["x"] for d in self._samples.values() if d is not None]
         if not xs:
@@ -328,6 +427,13 @@ class MainWindow(QMainWindow):
         x_min = min(float(a.min()) for a in xs)
         x_max = max(float(a.max()) for a in xs)
         self.input_panel.set_x_range(x_min, x_max)
+
+        max_speed = max(
+            float(np.max(d["speed"]))
+            for d in self._samples.values()
+            if d is not None
+        )
+        self.speed_panel.set_y_range(0, max_speed * 1.1)
 
         s1 = self._samples[1]
         s2 = self._samples[2]
