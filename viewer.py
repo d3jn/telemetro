@@ -444,6 +444,15 @@ class MainWindow(QMainWindow):
         if df is None or lap is None:
             return None
         lap_df = df[(df["lap_num"] == lap) & (df["lap_distance"] >= 0)]
+        # Drop pre-session capture artifacts: rows where the car is parked at
+        # the start line (lap_distance == 0 AND speed == 0) while lap_time
+        # ticks up. F1 25 emits these when the recorder runs during the
+        # waiting period before a session/lap actually starts. A real
+        # line-crossing row has racing speed; a genuine on-track stop has
+        # lap_distance > 0 — so this predicate only matches the artifact.
+        lap_df = lap_df[
+            ~((lap_df["lap_distance"] == 0) & (lap_df["speed"] == 0))
+        ]
         lap_df = lap_df.sort_values("lap_distance")
         if lap_df.empty:
             return None
@@ -615,21 +624,28 @@ class MainWindow(QMainWindow):
             self.delta_panel.setVisible(False)
             return
 
-        t1_full = self._smooth_elapsed_time_ms(
-            s1["x"], s1["speed"], float(s1["lap_time"][0])
-        )
-        t2_full = self._smooth_elapsed_time_ms(
-            s2["x"], s2["speed"], float(s2["lap_time"][0])
-        )
+        # Speed integration gives us a smooth time(distance) curve up to a
+        # constant. Anchor at 0 here — the absolute level is set by the
+        # end-anchor below.
+        t1_full = self._smooth_elapsed_time_ms(s1["x"], s1["speed"], 0.0)
+        t2_full = self._smooth_elapsed_time_ms(s2["x"], s2["speed"], 0.0)
 
         mask = (s1["x"] >= delta_x_min) & (s1["x"] <= delta_x_max)
         x_common = s1["x"][mask]
         t1 = t1_full[mask]
         t2 = np.interp(x_common, s2["x"], t2_full)
-        delta_s = (t1 - t2) / 1000.0
-        # Anchor the trace at 0 so the chart shows divergence from the
-        # comparison's start rather than the noisy first-row time offset.
-        delta_s = delta_s - delta_s[0]
+        raw_delta_ms = t1 - t2
+
+        # Anchor the END of the curve to the actual lap-time difference (=
+        # what subtracting the dropdown values gives). This way the chart's
+        # rightmost value always matches the lap-time subtraction, even when
+        # a sample is missing rows near the start (e.g. lerka's lap 2 in
+        # the reference data begins at lap_distance ≈ 12 m).
+        lap_diff_ms = (
+            float(np.max(s1["lap_time"])) - float(np.max(s2["lap_time"]))
+        )
+        shift_ms = lap_diff_ms - raw_delta_ms[-1]
+        delta_s = (raw_delta_ms + shift_ms) / 1000.0
 
         max_abs = float(np.max(np.abs(delta_s)))
         if max_abs == 0:
