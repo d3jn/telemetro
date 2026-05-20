@@ -28,6 +28,15 @@ from PySide6.QtWidgets import (
 )
 
 
+def _format_gear(v):
+    g = int(v)
+    if g == -1:
+        return "R"
+    if g == 0:
+        return "N"
+    return str(g)
+
+
 def _format_lap_time_ms(ms):
     if ms is None or pd.isna(ms) or ms <= 0:
         return "—"
@@ -177,10 +186,18 @@ class ChartPanel(QWidget):
         self._cursor_line.setVisible(False)
         self.plot_item.addItem(self._cursor_line, ignoreBounds=True)
 
-    def add_series(self, x, y, pen, label, sample_num=None, formatter=None):
+    def add_series(
+        self, x, y, pen, label, sample_num=None, formatter=None, step=False
+    ):
         if formatter is None:
             formatter = lambda v: f"{v:.0f}"
-        self.plot_item.plot(x, y, pen=pen)
+        plot_kwargs = {"pen": pen}
+        if step:
+            # Hold each sample's y until the next x, so discrete-valued
+            # signals (gear, ERS mode) render as a staircase instead of a
+            # diagonal connect-the-dots line.
+            plot_kwargs["stepMode"] = "right"
+        self.plot_item.plot(x, y, **plot_kwargs)
         self._series.append(
             {
                 "x": x,
@@ -188,6 +205,7 @@ class ChartPanel(QWidget):
                 "label": label,
                 "sample_num": sample_num,
                 "formatter": formatter,
+                "step": step,
             }
         )
 
@@ -263,7 +281,14 @@ class ChartPanel(QWidget):
             x, y = s["x"], s["y"]
             if x_val < x[0] or x_val > x[-1]:
                 continue
-            y_val = float(np.interp(x_val, x, y))
+            if s.get("step"):
+                # Read the sample that's *at or before* x_val so the tooltip
+                # reports the same value the staircase shows visually,
+                # without linear-interp blending two adjacent gears.
+                idx = max(0, np.searchsorted(x, x_val, side="right") - 1)
+                y_val = float(y[idx])
+            else:
+                y_val = float(np.interp(x_val, x, y))
             suffix = (
                 f" {s['sample_num']}"
                 if show_label and s["sample_num"] is not None
@@ -318,6 +343,14 @@ class MainWindow(QMainWindow):
             y_label="Speed (km/h)",
             y_range=(0, 350),  # placeholder; set per-render from data
         )
+        self.gear_panel = ChartPanel(
+            y_label="Gear",
+            y_range=(-1.5, 8.5),
+            y_ticks=(
+                [(-1, "R"), (0, "N")]
+                + [(g, str(g)) for g in range(1, 9)]
+            ),
+        )
         self.ers_panel = ChartPanel(
             y_label="ERS",
             y_range=(0, 110),
@@ -326,17 +359,20 @@ class MainWindow(QMainWindow):
         )
         self.delta_panel.link_x_to(self.input_panel)
         self.speed_panel.link_x_to(self.input_panel)
+        self.gear_panel.link_x_to(self.input_panel)
         self.ers_panel.link_x_to(self.input_panel)
 
         chart_stack = QSplitter(Qt.Orientation.Vertical)
         chart_stack.addWidget(self.delta_panel)
         chart_stack.addWidget(self.input_panel)
         chart_stack.addWidget(self.speed_panel)
+        chart_stack.addWidget(self.gear_panel)
         chart_stack.addWidget(self.ers_panel)
         chart_stack.setStretchFactor(0, 1)
         chart_stack.setStretchFactor(1, 3)
         chart_stack.setStretchFactor(2, 2)
         chart_stack.setStretchFactor(3, 2)
+        chart_stack.setStretchFactor(4, 2)
 
         # Trajectory: free pan/zoom, square aspect ratio so the track isn't
         # distorted. Deliberately not part of the linked X group on the left.
@@ -384,6 +420,7 @@ class MainWindow(QMainWindow):
             self.delta_panel,
             self.input_panel,
             self.speed_panel,
+            self.gear_panel,
             self.ers_panel,
         )
         for panel in self._left_panels:
@@ -469,6 +506,7 @@ class MainWindow(QMainWindow):
             "ers_pct": lap_df["ers_pct"].to_numpy(),
             "ers_mode": lap_df["ers_mode"].to_numpy(),
             "speed": lap_df["speed"].to_numpy(),
+            "gear": lap_df["gear"].to_numpy(),
             "world_x": lap_df["world_x"].to_numpy(),
             "world_z": lap_df["world_z"].to_numpy(),
         }
@@ -521,6 +559,7 @@ class MainWindow(QMainWindow):
         self.input_panel.clear()
         self.delta_panel.clear()
         self.speed_panel.clear()
+        self.gear_panel.clear()
         self.ers_panel.clear()
         self.trajectory_item.clear()
 
@@ -541,6 +580,10 @@ class MainWindow(QMainWindow):
         trajectory_pens = {
             1: pg.mkPen("b", width=3),
             2: pg.mkPen((100, 150, 240), width=3, style=Qt.PenStyle.DashLine),
+        }
+        gear_pens = {
+            1: pg.mkPen((255, 140, 0), width=3),
+            2: pg.mkPen((255, 200, 140), width=3, style=Qt.PenStyle.DashLine),
         }
         # (sample_num, ers_mode) → pen. modes: 0=none, 1=medium, 2=hotlap, 3=overtake.
         ers_pens = {
@@ -579,6 +622,15 @@ class MainWindow(QMainWindow):
                 pen=speed_pens[sample_num],
                 label="Speed",
                 sample_num=sample_num,
+            )
+            self.gear_panel.add_series(
+                data["x"],
+                data["gear"],
+                pen=gear_pens[sample_num],
+                label="Gear",
+                sample_num=sample_num,
+                formatter=_format_gear,
+                step=True,
             )
             self._add_ers_series(sample_num, data, ers_pens)
 
