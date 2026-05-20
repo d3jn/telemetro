@@ -636,16 +636,28 @@ class MainWindow(QMainWindow):
         t2 = np.interp(x_common, s2["x"], t2_full)
         raw_delta_ms = t1 - t2
 
-        # Anchor the END of the curve to the actual lap-time difference (=
-        # what subtracting the dropdown values gives). This way the chart's
-        # rightmost value always matches the lap-time subtraction, even when
-        # a sample is missing rows near the start (e.g. lerka's lap 2 in
-        # the reference data begins at lap_distance ≈ 12 m).
+        if len(x_common) < 2:
+            self.delta_panel.setVisible(False)
+            return
+
+        # Linear correction: zero the start AND land the end exactly on the
+        # lap-time difference (= subtracting the dropdown values). Both
+        # constraints can't be hit with a pure shift, so we subtract
+        # raw_delta[0] to anchor the start and add a constant-slope-in-X
+        # term to bring the end into place. Local curve shape — i.e. WHERE
+        # in the lap each driver gains/loses time — is preserved relative
+        # to that linear baseline.
         lap_diff_ms = (
             float(np.max(s1["lap_time"])) - float(np.max(s2["lap_time"]))
         )
-        shift_ms = lap_diff_ms - raw_delta_ms[-1]
-        delta_s = (raw_delta_ms + shift_ms) / 1000.0
+        raw_start = raw_delta_ms[0]
+        raw_end = raw_delta_ms[-1]
+        slope = (lap_diff_ms - (raw_end - raw_start)) / (
+            x_common[-1] - x_common[0]
+        )
+        delta_s = (
+            raw_delta_ms - raw_start + slope * (x_common - x_common[0])
+        ) / 1000.0
 
         max_abs = float(np.max(np.abs(delta_s)))
         if max_abs == 0:
