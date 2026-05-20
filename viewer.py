@@ -280,21 +280,59 @@ class MainWindow(QMainWindow):
         self.speed_panel.link_x_to(self.input_panel)
         self.ers_panel.link_x_to(self.input_panel)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(self.delta_panel)
-        splitter.addWidget(self.input_panel)
-        splitter.addWidget(self.speed_panel)
-        splitter.addWidget(self.ers_panel)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
-        splitter.setStretchFactor(2, 2)
-        splitter.setStretchFactor(3, 2)
-        root.addWidget(splitter, 1)
+        chart_stack = QSplitter(Qt.Orientation.Vertical)
+        chart_stack.addWidget(self.delta_panel)
+        chart_stack.addWidget(self.input_panel)
+        chart_stack.addWidget(self.speed_panel)
+        chart_stack.addWidget(self.ers_panel)
+        chart_stack.setStretchFactor(0, 1)
+        chart_stack.setStretchFactor(1, 3)
+        chart_stack.setStretchFactor(2, 2)
+        chart_stack.setStretchFactor(3, 2)
+
+        # Trajectory: free pan/zoom, square aspect ratio so the track isn't
+        # distorted. Deliberately not part of the linked X group on the left.
+        self.trajectory_plot = pg.PlotWidget(background="w")
+        self.trajectory_item = self.trajectory_plot.getPlotItem()
+        self.trajectory_item.showGrid(x=True, y=True, alpha=0.2)
+        traj_vb = self.trajectory_item.getViewBox()
+        traj_vb.setAspectLocked(True)
+        # F1 25 uses a left-handed Y-up world, so a top-down (X, Z) plot
+        # renders mirrored on a standard 2D chart. Inverting X restores the
+        # real-world orientation (left/right corners and rotation direction).
+        traj_vb.invertX(True)
+
+        main_split = QSplitter(Qt.Orientation.Horizontal)
+        main_split.addWidget(chart_stack)
+        main_split.addWidget(self.trajectory_plot)
+        main_split.setStretchFactor(0, 2)
+        main_split.setStretchFactor(1, 1)
+        root.addWidget(main_split, 1)
 
         self.delta_panel.setVisible(False)
 
         self._samples = {1: None, 2: None}
         self.render_btn.clicked.connect(self._on_render)
+
+    @staticmethod
+    def _smooth_elapsed_time_ms(x, speed_kmh, anchor_ms):
+        """Reconstruct a smooth elapsed-time-at-distance curve by integrating
+        speed.
+
+        Raw ``lap_time`` ships in the LAP packet, separate from CarTelemetry,
+        so UDP can deliver the two streams out of order — adjacent rows show
+        jitter of ±50-200 ms and occasional backward jumps. Integrating
+        ``lap_distance`` against ``speed`` (both from the same CarTelemetry
+        packet) produces a self-consistent monotonic curve. The anchor is
+        the first sample's reported ``lap_time``, preserving absolute time
+        since the lap-start line (modulo one tiny error at row 0).
+        """
+        if len(x) < 2:
+            return np.array([anchor_ms], dtype=float)
+        speed_ms = np.maximum(speed_kmh.astype(float) / 3.6, 0.5)
+        avg_speed = (speed_ms[:-1] + speed_ms[1:]) / 2
+        dt_ms = np.diff(x) / avg_speed * 1000.0
+        return anchor_ms + np.concatenate([[0.0], np.cumsum(dt_ms)])
 
     @staticmethod
     def _extract_lap(sample):
@@ -314,6 +352,8 @@ class MainWindow(QMainWindow):
             "ers_pct": lap_df["ers_pct"].to_numpy(),
             "ers_mode": lap_df["ers_mode"].to_numpy(),
             "speed": lap_df["speed"].to_numpy(),
+            "world_x": lap_df["world_x"].to_numpy(),
+            "world_z": lap_df["world_z"].to_numpy(),
         }
 
     def _add_ers_series(self, sample_num, data, ers_pens):
@@ -365,6 +405,7 @@ class MainWindow(QMainWindow):
         self.delta_panel.clear()
         self.speed_panel.clear()
         self.ers_panel.clear()
+        self.trajectory_item.clear()
 
         input_pens = {
             (1, "throttle"): pg.mkPen("g", width=3),
@@ -377,6 +418,10 @@ class MainWindow(QMainWindow):
             ),
         }
         speed_pens = {
+            1: pg.mkPen("b", width=3),
+            2: pg.mkPen((100, 150, 240), width=3, style=Qt.PenStyle.DashLine),
+        }
+        trajectory_pens = {
             1: pg.mkPen("b", width=3),
             2: pg.mkPen((100, 150, 240), width=3, style=Qt.PenStyle.DashLine),
         }
@@ -420,6 +465,18 @@ class MainWindow(QMainWindow):
             )
             self._add_ers_series(sample_num, data, ers_pens)
 
+            wx = data["world_x"]
+            wz = data["world_z"]
+            valid = ~np.isnan(wx) & ~np.isnan(wz)
+            if valid.any():
+                self.trajectory_item.plot(
+                    wx[valid], wz[valid], pen=trajectory_pens[sample_num]
+                )
+
+        # Trajectory fits all data with 10% padding. autoRange + padding
+        # respects the aspect lock automatically.
+        self.trajectory_item.getViewBox().autoRange(padding=0.1)
+
         xs = [d["x"] for d in self._samples.values() if d is not None]
         if not xs:
             self.delta_panel.setVisible(False)
@@ -447,11 +504,21 @@ class MainWindow(QMainWindow):
             self.delta_panel.setVisible(False)
             return
 
+        t1_full = self._smooth_elapsed_time_ms(
+            s1["x"], s1["speed"], float(s1["lap_time"][0])
+        )
+        t2_full = self._smooth_elapsed_time_ms(
+            s2["x"], s2["speed"], float(s2["lap_time"][0])
+        )
+
         mask = (s1["x"] >= delta_x_min) & (s1["x"] <= delta_x_max)
         x_common = s1["x"][mask]
-        t1 = s1["lap_time"][mask]
-        t2 = np.interp(x_common, s2["x"], s2["lap_time"])
+        t1 = t1_full[mask]
+        t2 = np.interp(x_common, s2["x"], t2_full)
         delta_s = (t1 - t2) / 1000.0
+        # Anchor the trace at 0 so the chart shows divergence from the
+        # comparison's start rather than the noisy first-row time offset.
+        delta_s = delta_s - delta_s[0]
 
         max_abs = float(np.max(np.abs(delta_s)))
         if max_abs == 0:
