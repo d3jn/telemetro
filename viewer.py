@@ -253,8 +253,13 @@ class ChartPanel(QWidget):
         }
         show_label = len(sample_nums) > 1
 
+        # Series are added in (2, 1) order so sample 1 lands on top
+        # visually; sort here so the tooltip lists sample 1 first regardless.
+        sorted_series = sorted(
+            self._series, key=lambda s: s["sample_num"] or 0
+        )
         lines = []
-        for s in self._series:
+        for s in sorted_series:
             x, y = s["x"], s["y"]
             if x_val < x[0] or x_val > x[-1]:
                 continue
