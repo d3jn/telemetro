@@ -351,6 +351,14 @@ class MainWindow(QMainWindow):
                 + [(g, str(g)) for g in range(1, 9)]
             ),
         )
+        # Steering is bounded ±100 by the game; the 10% allowance gives a
+        # visible gap at full lock. Range is fixed regardless of data so
+        # the centre line and full-lock positions don't drift between laps.
+        self.steering_panel = ChartPanel(
+            y_label="Steer",
+            y_range=(-110, 110),
+            y_ticks=[(v, str(v)) for v in (-100, -50, 0, 50, 100)],
+        )
         self.ers_panel = ChartPanel(
             y_label="ERS",
             y_range=(0, 110),
@@ -360,6 +368,7 @@ class MainWindow(QMainWindow):
         self.delta_panel.link_x_to(self.input_panel)
         self.speed_panel.link_x_to(self.input_panel)
         self.gear_panel.link_x_to(self.input_panel)
+        self.steering_panel.link_x_to(self.input_panel)
         self.ers_panel.link_x_to(self.input_panel)
 
         chart_stack = QSplitter(Qt.Orientation.Vertical)
@@ -367,12 +376,14 @@ class MainWindow(QMainWindow):
         chart_stack.addWidget(self.input_panel)
         chart_stack.addWidget(self.speed_panel)
         chart_stack.addWidget(self.gear_panel)
+        chart_stack.addWidget(self.steering_panel)
         chart_stack.addWidget(self.ers_panel)
         chart_stack.setStretchFactor(0, 1)
         chart_stack.setStretchFactor(1, 3)
         chart_stack.setStretchFactor(2, 2)
         chart_stack.setStretchFactor(3, 2)
         chart_stack.setStretchFactor(4, 2)
+        chart_stack.setStretchFactor(5, 2)
 
         # Trajectory: free pan/zoom, square aspect ratio so the track isn't
         # distorted. Deliberately not part of the linked X group on the left.
@@ -421,6 +432,7 @@ class MainWindow(QMainWindow):
             self.input_panel,
             self.speed_panel,
             self.gear_panel,
+            self.steering_panel,
             self.ers_panel,
         )
         for panel in self._left_panels:
@@ -507,6 +519,7 @@ class MainWindow(QMainWindow):
             "ers_mode": lap_df["ers_mode"].to_numpy(),
             "speed": lap_df["speed"].to_numpy(),
             "gear": lap_df["gear"].to_numpy(),
+            "steer": lap_df["steer"].to_numpy(),
             "world_x": lap_df["world_x"].to_numpy(),
             "world_z": lap_df["world_z"].to_numpy(),
         }
@@ -560,6 +573,7 @@ class MainWindow(QMainWindow):
         self.delta_panel.clear()
         self.speed_panel.clear()
         self.gear_panel.clear()
+        self.steering_panel.clear()
         self.ers_panel.clear()
         self.trajectory_item.clear()
 
@@ -584,6 +598,10 @@ class MainWindow(QMainWindow):
         gear_pens = {
             1: pg.mkPen((255, 140, 0), width=3),
             2: pg.mkPen((255, 200, 140), width=3, style=Qt.PenStyle.DashLine),
+        }
+        steering_pens = {
+            1: pg.mkPen((160, 32, 240), width=3),
+            2: pg.mkPen((210, 160, 240), width=3, style=Qt.PenStyle.DashLine),
         }
         # (sample_num, ers_mode) → pen. modes: 0=none, 1=medium, 2=hotlap, 3=overtake.
         ers_pens = {
@@ -631,6 +649,13 @@ class MainWindow(QMainWindow):
                 sample_num=sample_num,
                 formatter=_format_gear,
                 step=True,
+            )
+            self.steering_panel.add_series(
+                data["x"],
+                data["steer"],
+                pen=steering_pens[sample_num],
+                label="Steer",
+                sample_num=sample_num,
             )
             self._add_ers_series(sample_num, data, ers_pens)
 
