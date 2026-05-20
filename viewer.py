@@ -11,7 +11,7 @@ import sys
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -106,7 +106,17 @@ class ChartPanel(QWidget):
     Holds a list of series (each: x, y, tooltip label, optional sample number,
     value formatter). On hover, interpolates each series at the cursor's X
     position and shows a tooltip listing all in-range values.
+
+    Also emits ``x_hovered(float)`` / ``x_unhovered()`` so external listeners
+    (e.g. the trajectory map) can react to the cursor's data-space X.
     """
+
+    x_hovered = Signal(float)
+    x_unhovered = Signal()
+
+    # Pixel width forced on the left axis of every panel so stacked panels'
+    # plot areas line up exactly regardless of tick-label or title length.
+    Y_AXIS_WIDTH = 70
 
     def __init__(
         self,
@@ -136,8 +146,10 @@ class ChartPanel(QWidget):
         vb.setMouseEnabled(x=True, y=False)
         vb.setLimits(yMin=y_min, yMax=y_max)
 
+        left_axis = self.plot_item.getAxis("left")
+        left_axis.setWidth(self.Y_AXIS_WIDTH)
         if y_ticks is not None:
-            self.plot_item.getAxis("left").setTicks([y_ticks, []])
+            left_axis.setTicks([y_ticks, []])
 
         layout.addWidget(self.plot_widget)
 
@@ -147,9 +159,23 @@ class ChartPanel(QWidget):
             slot=self._on_mouse_move,
         )
 
+        # Crosshair line; driven externally so all linked panels move in sync.
+        # ignoreBounds keeps it out of auto-range calculations.
+        self._cursor_line = pg.InfiniteLine(
+            angle=90,
+            movable=False,
+            pen=pg.mkPen((100, 100, 100), width=1, style=Qt.PenStyle.DashLine),
+        )
+        self._cursor_line.setVisible(False)
+        self.plot_item.addItem(self._cursor_line, ignoreBounds=True)
+
     def clear(self):
         self._series.clear()
         self.plot_item.clear()
+        # plot_item.clear() detaches everything we added, including the
+        # crosshair. Reattach it (hidden) so hover can show it again.
+        self._cursor_line.setVisible(False)
+        self.plot_item.addItem(self._cursor_line, ignoreBounds=True)
 
     def add_series(self, x, y, pen, label, sample_num=None, formatter=None):
         if formatter is None:
@@ -183,6 +209,13 @@ class ChartPanel(QWidget):
         vb.setLimits(yMin=y_min, yMax=y_max)
         self.plot_item.setYRange(y_min, y_max, padding=0)
 
+    def show_cursor_x(self, x):
+        self._cursor_line.setPos(x)
+        self._cursor_line.setVisible(True)
+
+    def hide_cursor(self):
+        self._cursor_line.setVisible(False)
+
     def link_x_to(self, other):
         self.plot_item.setXLink(other.plot_item)
         # Merge into a flat group: every member lists the others, so any
@@ -194,16 +227,26 @@ class ChartPanel(QWidget):
         for panel in group:
             panel._x_linked = [p for p in group if p is not panel]
 
+    def leaveEvent(self, event):
+        # sigMouseMoved only fires while the mouse is inside the scene, so
+        # we need leaveEvent to catch the cursor leaving the widget entirely.
+        QToolTip.hideText()
+        self.x_unhovered.emit()
+        super().leaveEvent(event)
+
     def _on_mouse_move(self, event):
         if not self._series:
             QToolTip.hideText()
+            self.x_unhovered.emit()
             return
         pos = event[0]
         vb = self.plot_item.getViewBox()
         if not vb.sceneBoundingRect().contains(pos):
             QToolTip.hideText()
+            self.x_unhovered.emit()
             return
         x_val = vb.mapSceneToView(pos).x()
+        self.x_hovered.emit(float(x_val))
 
         sample_nums = {
             s["sample_num"] for s in self._series if s["sample_num"] is not None
@@ -311,8 +354,68 @@ class MainWindow(QMainWindow):
 
         self.delta_panel.setVisible(False)
 
+        # Trajectory markers — solid filled circles, 2× the trajectory line
+        # width (3px) → 6px diameter. pxMode=True keeps them screen-pixel
+        # sized regardless of zoom. Hidden until a left-panel hover lands.
+        self.trajectory_markers = {
+            1: pg.ScatterPlotItem(
+                size=6, brush=pg.mkBrush("b"), pen=pg.mkPen(None), pxMode=True
+            ),
+            2: pg.ScatterPlotItem(
+                size=6,
+                brush=pg.mkBrush((100, 150, 240)),
+                pen=pg.mkPen(None),
+                pxMode=True,
+            ),
+        }
+        # Add sample 2 first so sample 1's marker sits on top wherever they
+        # overlap, matching the line z-order convention.
+        for sample_num in (2, 1):
+            marker = self.trajectory_markers[sample_num]
+            marker.setVisible(False)
+            self.trajectory_item.addItem(marker)
+
+        self._left_panels = (
+            self.delta_panel,
+            self.input_panel,
+            self.speed_panel,
+            self.ers_panel,
+        )
+        for panel in self._left_panels:
+            panel.x_hovered.connect(self._on_chart_x_hovered)
+            panel.x_unhovered.connect(self._on_chart_x_unhovered)
+
         self._samples = {1: None, 2: None}
         self.render_btn.clicked.connect(self._on_render)
+
+    def _on_chart_x_hovered(self, x_val):
+        for panel in self._left_panels:
+            panel.show_cursor_x(x_val)
+        for sample_num, data in self._samples.items():
+            marker = self.trajectory_markers[sample_num]
+            if data is None:
+                marker.setVisible(False)
+                continue
+            xs = data["x"]
+            if x_val < xs[0] or x_val > xs[-1]:
+                marker.setVisible(False)
+                continue
+            wx = data["world_x"]
+            wz = data["world_z"]
+            valid = ~np.isnan(wx) & ~np.isnan(wz)
+            if not valid.any():
+                marker.setVisible(False)
+                continue
+            world_x = float(np.interp(x_val, xs[valid], wx[valid]))
+            world_z = float(np.interp(x_val, xs[valid], wz[valid]))
+            marker.setData(x=[world_x], y=[world_z])
+            marker.setVisible(True)
+
+    def _on_chart_x_unhovered(self):
+        for panel in self._left_panels:
+            panel.hide_cursor()
+        for marker in self.trajectory_markers.values():
+            marker.setVisible(False)
 
     @staticmethod
     def _smooth_elapsed_time_ms(x, speed_kmh, anchor_ms):
@@ -476,6 +579,14 @@ class MainWindow(QMainWindow):
         # Trajectory fits all data with 10% padding. autoRange + padding
         # respects the aspect lock automatically.
         self.trajectory_item.getViewBox().autoRange(padding=0.1)
+
+        # Re-add hover markers — clear() removed them. Added last so they
+        # render on top of the trajectory lines; sample 2 first so sample 1
+        # sits on top wherever they overlap.
+        for sample_num in (2, 1):
+            marker = self.trajectory_markers[sample_num]
+            marker.setVisible(False)
+            self.trajectory_item.addItem(marker)
 
         xs = [d["x"] for d in self._samples.values() if d is not None]
         if not xs:
