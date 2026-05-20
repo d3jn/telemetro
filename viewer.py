@@ -519,7 +519,9 @@ class MainWindow(QMainWindow):
             "ers_mode": lap_df["ers_mode"].to_numpy(),
             "speed": lap_df["speed"].to_numpy(),
             "gear": lap_df["gear"].to_numpy(),
-            "steer": lap_df["steer"].to_numpy(),
+            # F1 25 reports steer as positive-right / negative-left. Flip
+            # the sign so the panel reads left=+ and right=- as requested.
+            "steer": -lap_df["steer"].to_numpy(),
             "world_x": lap_df["world_x"].to_numpy(),
             "world_z": lap_df["world_z"].to_numpy(),
         }
