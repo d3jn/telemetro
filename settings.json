@@ -1,4 +1,7 @@
 {
   "udp_port": 20777,
-  "output_dir": "recordings"
+  "output_dir": "recordings",
+  "viewer": {
+    "downsample_hz": 20
+  }
 }

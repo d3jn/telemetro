@@ -193,9 +193,17 @@ def parse_lap(data):
             # previous lap, set the moment S/F is crossed.
             "last_lap_time_ms": l[0],
             "lap_time_ms": l[1],
+            # Sector times come split as (msPart:H, minutesPart:B) to support
+            # >65s sectors. Combine to a single ms value. Each is 0 until the
+            # car crosses that sector's boundary, then latched.
+            "sector1_time_ms": l[3] * 60000 + l[2],
+            "sector2_time_ms": l[5] * 60000 + l[4],
             "lap_distance": l[10],
             "lap_num": l[14],
             "pit_status": l[15],
+            # 0=S1, 1=S2, 2=S3. Used downstream to identify the lap_distance
+            # at which the car crossed each sector boundary.
+            "sector_idx": l[17],
         })
         offset += LAP_DATA_SIZE
     return out

@@ -6,6 +6,8 @@ shared X axis: a time-delta panel (shown only when both samples are loaded)
 above an inputs panel.
 """
 
+import json
+import os
 import sys
 
 import numpy as np
@@ -16,16 +18,79 @@ from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
     QPushButton,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QToolTip,
     QVBoxLayout,
     QWidget,
 )
+
+
+def _base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_viewer_settings():
+    """Read the "viewer" section of settings.json. Missing file or section
+    is fine — we just return defaults so the app works out of the box."""
+    path = os.path.join(_base_dir(), "settings.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data.get("viewer", {}) or {}
+
+
+def _downsample_lap_df(lap_df, target_hz):
+    """Block-average consecutive rows down to ``target_hz``.
+
+    Estimates the source rate from the median ``lap_time`` interval, then
+    bins every ``round(source_hz / target_hz)`` consecutive rows. Continuous
+    columns are averaged (smoothing the trace); discrete columns (gear,
+    ers_mode, lap_num) take the first value of each bin so step renders and
+    integer tooltips stay sensible. Pure in-memory — the source CSV is not
+    touched.
+    """
+    if target_hz is None or target_hz <= 0:
+        return lap_df
+    if len(lap_df) < 2:
+        return lap_df
+
+    dt_ms = np.diff(lap_df["lap_time"].to_numpy())
+    dt_ms = dt_ms[dt_ms > 0]  # drop jitter-induced backward jumps
+    if len(dt_ms) == 0:
+        return lap_df
+    source_hz = 1000.0 / float(np.median(dt_ms))
+
+    bin_size = int(round(source_hz / target_hz))
+    if bin_size <= 1:
+        return lap_df
+
+    bins = np.arange(len(lap_df)) // bin_size
+    first_cols = ("gear", "ers_mode", "lap_num", "lap_run", "sector_idx")
+    # sector1_time / sector2_time / last_lap_time are 0 then latched to a
+    # game-stamped value; max() preserves the latch through bin boundaries
+    # rather than smearing the 0→value transition with a mean.
+    max_cols = ("sector1_time", "sector2_time", "last_lap_time")
+    agg = {}
+    for col in lap_df.columns:
+        if col in first_cols:
+            agg[col] = "first"
+        elif col in max_cols:
+            agg[col] = "max"
+        else:
+            agg[col] = "mean"
+    return lap_df.groupby(bins).agg(agg)
 
 
 def _format_gear(v):
@@ -48,6 +113,8 @@ def _format_lap_time_ms(ms):
 
 class SampleLoader(QWidget):
     """One "Load sample N" button + the lap dropdown that follows it."""
+
+    state_changed = Signal()
 
     def __init__(self, label, parent=None):
         super().__init__(parent)
@@ -85,58 +152,83 @@ class SampleLoader(QWidget):
             self.lap_combo.clear()
             self.lap_combo.setEnabled(False)
             QMessageBox.critical(self, "Load failed", f"Could not read {path}:\n{e}")
-            return
-
-        self._df = df
-        self._path = path
-        self._populate_laps()
+        else:
+            self._df = df
+            self._path = path
+            self._populate_laps()
+        self.state_changed.emit()
 
     def _populate_laps(self):
+        """Build the lap dropdown. The lap time shown for each entry is the
+        game-authoritative ``last_lap_time`` stamped on the first row of the
+        following (lap_num, lap_run) block — that's the value the game
+        writes the instant the S/F line is crossed, with no UDP jitter. For
+        flashback-abandoned blocks (next block has same/lower lap_num or
+        same lap_num + different lap_run) and the trailing block of the
+        recording (no successor), we fall back to ``max(lap_time)`` so the
+        partial lap still appears with a representative time."""
         self.lap_combo.clear()
-        if self._df is None or "lap_num" not in self._df.columns:
+        if self._df is None or self._df.empty:
             self.lap_combo.setEnabled(False)
             return
 
-        # lap_run distinguishes the original pass through a lap from any
-        # replays the game produced after a flashback / load-from-save (same
-        # lap_num, second life). Old recorders didn't emit it — fall back to
-        # lap_num-only grouping so existing CSVs still open.
-        has_run = "lap_run" in self._df.columns
-        group_cols = ["lap_num", "lap_run"] if has_run else ["lap_num"]
-        # Lap time per lap = max running timer seen during that lap. The timer
-        # resets to 0 on each new lap, so its peak is the lap's final reading.
-        grouped = self._df.groupby(group_cols)["lap_time"].max().sort_index()
-
-        if not has_run:
-            for lap_num, lap_ms in grouped.items():
-                if pd.isna(lap_num):
-                    continue
-                text = f"#{int(lap_num)} {_format_lap_time_ms(lap_ms)}"
-                self.lap_combo.addItem(text, userData=(int(lap_num), None))
-            self.lap_combo.setEnabled(self.lap_combo.count() > 0)
+        df = self._df.reset_index(drop=True)
+        lap_nums = df["lap_num"].to_numpy()
+        lap_runs = df["lap_run"].to_numpy()
+        last_lap_times = df["last_lap_time"].to_numpy()
+        lap_times = df["lap_time"].to_numpy()
+        n = len(df)
+        if n == 0:
+            self.lap_combo.setEnabled(False)
             return
 
-        # Re-number runs per-lap starting from 1, so users see "(run 1) /
-        # (run 2)" instead of the raw global counter (which can skip values
-        # when a flashback lands in the middle of a different lap).
-        runs_per_lap = {}
-        for lap_num, lap_run in grouped.index:
-            if pd.isna(lap_num) or pd.isna(lap_run):
+        # Indices where a new (lap_num, lap_run) block starts.
+        starts = [0]
+        for i in range(1, n):
+            if lap_nums[i] != lap_nums[i - 1] or lap_runs[i] != lap_runs[i - 1]:
+                starts.append(i)
+
+        entries = []  # (lap_num, lap_run, time_ms)
+        for k, start in enumerate(starts):
+            end = (starts[k + 1] - 1) if k + 1 < len(starts) else n - 1
+            ln = lap_nums[start]
+            lr = lap_runs[start]
+            if pd.isna(ln) or pd.isna(lr):
                 continue
-            runs_per_lap[int(lap_num)] = runs_per_lap.get(int(lap_num), 0) + 1
+            ln, lr = int(ln), int(lr)
+            time_ms = None
+            if k + 1 < len(starts):
+                next_start = starts[k + 1]
+                next_ln = lap_nums[next_start]
+                if not pd.isna(next_ln) and int(next_ln) == ln + 1:
+                    llt = last_lap_times[next_start]
+                    if not pd.isna(llt) and llt > 0:
+                        time_ms = float(llt)
+            if time_ms is None:
+                block_lt = lap_times[start : end + 1]
+                valid = ~pd.isna(block_lt)
+                if valid.any():
+                    m = float(block_lt[valid].max())
+                    if m > 0:
+                        time_ms = m
+            if time_ms is None:
+                continue
+            entries.append((ln, lr, time_ms))
+
+        # Renumber runs per-lap from 1 so "(run 1) / (run 2)" beats the raw
+        # global counter, which can skip values across other laps.
+        runs_per_lap = {}
+        for ln, _, _ in entries:
+            runs_per_lap[ln] = runs_per_lap.get(ln, 0) + 1
 
         display_index = {}
-        for (lap_num, lap_run), lap_ms in grouped.items():
-            if pd.isna(lap_num) or pd.isna(lap_run):
-                continue
-            ln = int(lap_num)
-            lr = int(lap_run)
+        for ln, lr, time_ms in entries:
             display_index[ln] = display_index.get(ln, 0) + 1
             if runs_per_lap[ln] > 1:
-                text = f"#{ln} (run {display_index[ln]}) {_format_lap_time_ms(lap_ms)}"
+                text = f"#{ln} (run {display_index[ln]}) {_format_lap_time_ms(time_ms)}"
             else:
-                text = f"#{ln} {_format_lap_time_ms(lap_ms)}"
-            self.lap_combo.addItem(text, userData=(ln, lr))
+                text = f"#{ln} {_format_lap_time_ms(time_ms)}"
+            self.lap_combo.addItem(text, userData=(ln, lr, time_ms))
 
         self.lap_combo.setEnabled(self.lap_combo.count() > 0)
 
@@ -331,7 +423,58 @@ class ChartPanel(QWidget):
         if not lines:
             QToolTip.hideText()
             return
+        lines.append(f"Distance: {x_val:.0f} m")
         QToolTip.showText(QCursor.pos(), "\n".join(lines), self.plot_widget)
+
+
+class StatsDialog(QDialog):
+    """Modal table of per-sample lap statistics, recomputed on every open."""
+
+    def __init__(self, samples, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Stats")
+        self.setModal(True)
+
+        loaded = {n: d for n, d in samples.items() if d is not None}
+        sample_nums = sorted(loaded.keys())
+        col_headers = ["Statistic"] + [f"Sample {n}" for n in sample_nums]
+        rows = self._compute_rows(loaded)
+
+        table = QTableWidget(len(rows), len(col_headers))
+        table.setHorizontalHeaderLabels(col_headers)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        for r, (stat_name, values) in enumerate(rows):
+            table.setItem(r, 0, QTableWidgetItem(stat_name))
+            for c, n in enumerate(sample_nums, start=1):
+                table.setItem(r, c, QTableWidgetItem(values.get(n, "—")))
+        table.resizeColumnsToContents()
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(table)
+        layout.addLayout(btn_row)
+
+        self.resize(450, 200)
+
+    @staticmethod
+    def _compute_rows(loaded):
+        """Returns [(statistic_name, {sample_num: formatted_value}), ...]."""
+        return [
+            (
+                "Top speed",
+                {
+                    n: f"{int(np.max(d['speed']))} km/h"
+                    for n, d in loaded.items()
+                },
+            ),
+        ]
 
 
 class MainWindow(QMainWindow):
@@ -357,6 +500,14 @@ class MainWindow(QMainWindow):
 
         self.render_btn = QPushButton("Render")
         top.addWidget(self.render_btn)
+
+        self.stats_btn = QPushButton("Stats")
+        self.stats_btn.setEnabled(False)
+        self.stats_btn.clicked.connect(self._on_stats_clicked)
+        top.addWidget(self.stats_btn)
+
+        self.sample1.state_changed.connect(self._update_stats_btn)
+        self.sample2.state_changed.connect(self._update_stats_btn)
 
         root.addLayout(top)
 
@@ -472,7 +623,23 @@ class MainWindow(QMainWindow):
             panel.x_unhovered.connect(self._on_chart_x_unhovered)
 
         self._samples = {1: None, 2: None}
+        self._downsample_hz = _load_viewer_settings().get("downsample_hz")
         self.render_btn.clicked.connect(self._on_render)
+
+    def _update_stats_btn(self):
+        has_data = any(
+            sample._df is not None
+            and sample.lap_combo.currentData() is not None
+            for sample in (self.sample1, self.sample2)
+        )
+        self.stats_btn.setEnabled(has_data)
+
+    def _on_stats_clicked(self):
+        samples = {
+            1: self._extract_lap(self.sample1),
+            2: self._extract_lap(self.sample2),
+        }
+        StatsDialog(samples, parent=self).exec()
 
     def _on_chart_x_hovered(self, x_val):
         for panel in self._left_panels:
@@ -524,12 +691,78 @@ class MainWindow(QMainWindow):
         return anchor_ms + np.concatenate([[0.0], np.cumsum(dt_ms)])
 
     @staticmethod
-    def _extract_lap(sample):
+    def _calibrated_elapsed_time_ms(data):
+        """Piecewise-linear calibration of speed-integrated time against the
+        game's sector and lap-total stamps.
+
+        Anchors (when available): t(S1 boundary) = sector1_time,
+        t(S2 boundary) = sector1_time + sector2_time, t(last row) =
+        lap_total_ms. Between anchors, the relative integration is stretched
+        linearly so its endpoints match — the SHAPE within each segment is
+        preserved (which is what tells you where on track time was gained
+        or lost) while the absolute level matches the game's authoritative
+        stamps. Sector 1 with no start-of-lap anchor gets a pure shift; if
+        any anchor is unavailable (incomplete lap, no boundary crossed),
+        the corresponding segment falls back to the previous segment's
+        anchor + raw integration.
+        """
+        x = data["x"]
+        speed = data["speed"]
+        sector_idx = data["sector_idx"].astype(int)
+        s1_ms = data.get("sector1_time_ms") or 0.0
+        s2_ms = data.get("sector2_time_ms") or 0.0
+        total_ms = data.get("lap_total_ms")
+
+        t_rel = MainWindow._smooth_elapsed_time_ms(x, speed, 0.0)
+        t = t_rel.copy()
+        n = len(t)
+        if n == 0:
+            return t
+
+        in_s2 = sector_idx >= 1
+        in_s3 = sector_idx >= 2
+        i_s1 = int(np.argmax(in_s2)) if in_s2.any() else -1
+        i_s2 = int(np.argmax(in_s3)) if in_s3.any() else -1
+
+        # Sector 1: pure shift (no lap-start anchor; data may begin mid-sector).
+        if i_s1 > 0 and s1_ms > 0:
+            shift = s1_ms - t_rel[i_s1]
+            t[: i_s1 + 1] = t_rel[: i_s1 + 1] + shift
+
+        # Sector 2: piecewise linear stretch between S1 and S2 anchors.
+        if i_s1 >= 0 and i_s2 > i_s1 and s1_ms > 0 and s2_ms > 0:
+            rel_lo = t_rel[i_s1]
+            rel_hi = t_rel[i_s2]
+            if rel_hi > rel_lo:
+                scale = s2_ms / (rel_hi - rel_lo)
+                t[i_s1 + 1 : i_s2 + 1] = (
+                    s1_ms + (t_rel[i_s1 + 1 : i_s2 + 1] - rel_lo) * scale
+                )
+
+        # Sector 3: piecewise linear stretch between S2 anchor and lap end.
+        if (
+            i_s2 > 0
+            and total_ms is not None
+            and s1_ms > 0
+            and s2_ms > 0
+        ):
+            s3_ms = total_ms - s1_ms - s2_ms
+            rel_lo = t_rel[i_s2]
+            rel_hi = t_rel[-1]
+            if rel_hi > rel_lo and s3_ms > 0:
+                scale = s3_ms / (rel_hi - rel_lo)
+                t[i_s2 + 1 :] = (
+                    (s1_ms + s2_ms) + (t_rel[i_s2 + 1 :] - rel_lo) * scale
+                )
+
+        return t
+
+    def _extract_lap(self, sample):
         df = sample._df
         selection = sample.lap_combo.currentData()
         if df is None or selection is None:
             return None
-        lap, lap_run = selection
+        lap, lap_run, lap_total_ms = selection
         lap_df = df[df["lap_num"] == lap]
         if lap_run is not None and "lap_run" in df.columns:
             lap_df = lap_df[lap_df["lap_run"] == lap_run]
@@ -546,6 +779,7 @@ class MainWindow(QMainWindow):
         lap_df = lap_df.sort_values("lap_distance")
         if lap_df.empty:
             return None
+        lap_df = _downsample_lap_df(lap_df, self._downsample_hz)
         return {
             "x": lap_df["lap_distance"].to_numpy(),
             "throttle": lap_df["throttle"].to_numpy(),
@@ -560,6 +794,15 @@ class MainWindow(QMainWindow):
             "steer": -lap_df["steer"].to_numpy(),
             "world_x": lap_df["world_x"].to_numpy(),
             "world_z": lap_df["world_z"].to_numpy(),
+            "sector_idx": lap_df["sector_idx"].to_numpy(),
+            # sector1_time / sector2_time are 0 until the corresponding
+            # boundary is crossed, then latched to the game-stamped value.
+            # max() picks the latched value (or stays 0 if never crossed).
+            "sector1_time_ms": float(lap_df["sector1_time"].max() or 0),
+            "sector2_time_ms": float(lap_df["sector2_time"].max() or 0),
+            # Game-authoritative total from the next block's last_lap_time;
+            # None when the recording ended before the line crossing.
+            "lap_total_ms": float(lap_total_ms) if lap_total_ms else None,
         }
 
     def _add_ers_series(self, sample_num, data, ers_pens):
@@ -744,40 +987,25 @@ class MainWindow(QMainWindow):
             self.delta_panel.setVisible(False)
             return
 
-        # Speed integration gives us a smooth time(distance) curve up to a
-        # constant. Anchor at 0 here — the absolute level is set by the
-        # end-anchor below.
-        t1_full = self._smooth_elapsed_time_ms(s1["x"], s1["speed"], 0.0)
-        t2_full = self._smooth_elapsed_time_ms(s2["x"], s2["speed"], 0.0)
+        # Calibrated delta. Each sample's time-vs-distance is reconstructed
+        # by integrating speed for shape, then anchored at sector boundaries
+        # (sector1_time, sector1_time + sector2_time) and lap end
+        # (lap_total_ms) — all game-authoritative, jitter-free stamps. The
+        # 3% bias of pure speed integration is absorbed into the per-sector
+        # linear stretch, so delta at S1, S2, and the finish line is exact
+        # to within ≤1 sample's worth of boundary-detection slop.
+        t1_full = self._calibrated_elapsed_time_ms(s1)
+        t2_full = self._calibrated_elapsed_time_ms(s2)
 
         mask = (s1["x"] >= delta_x_min) & (s1["x"] <= delta_x_max)
         x_common = s1["x"][mask]
-        t1 = t1_full[mask]
-        t2 = np.interp(x_common, s2["x"], t2_full)
-        raw_delta_ms = t1 - t2
-
         if len(x_common) < 2:
             self.delta_panel.setVisible(False)
             return
 
-        # Linear correction: zero the start AND land the end exactly on the
-        # lap-time difference (= subtracting the dropdown values). Both
-        # constraints can't be hit with a pure shift, so we subtract
-        # raw_delta[0] to anchor the start and add a constant-slope-in-X
-        # term to bring the end into place. Local curve shape — i.e. WHERE
-        # in the lap each driver gains/loses time — is preserved relative
-        # to that linear baseline.
-        lap_diff_ms = (
-            float(np.max(s1["lap_time"])) - float(np.max(s2["lap_time"]))
-        )
-        raw_start = raw_delta_ms[0]
-        raw_end = raw_delta_ms[-1]
-        slope = (lap_diff_ms - (raw_end - raw_start)) / (
-            x_common[-1] - x_common[0]
-        )
-        delta_s = (
-            raw_delta_ms - raw_start + slope * (x_common - x_common[0])
-        ) / 1000.0
+        t1 = t1_full[mask]
+        t2 = np.interp(x_common, s2["x"], t2_full)
+        delta_s = (t1 - t2) / 1000.0
 
         max_abs = float(np.max(np.abs(delta_s)))
         if max_abs == 0:

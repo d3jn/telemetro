@@ -47,6 +47,9 @@ ROW_FIELDS = [
     "lap_time",
     "lap_distance",
     "last_lap_time",
+    "sector1_time",
+    "sector2_time",
+    "sector_idx",
 ]
 
 
@@ -358,6 +361,9 @@ class Recorder:
                 "lap_time": lap["lap_time_ms"] if lap else "",
                 "lap_distance": f"{lap['lap_distance']:.2f}" if lap else "",
                 "last_lap_time": lap["last_lap_time_ms"] if lap else "",
+                "sector1_time": lap["sector1_time_ms"] if lap else "",
+                "sector2_time": lap["sector2_time_ms"] if lap else "",
+                "sector_idx": lap["sector_idx"] if lap else "",
             }
             try:
                 writer.writerow(row)
