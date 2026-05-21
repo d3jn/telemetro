@@ -477,7 +477,27 @@ class StatsDialog(QDialog):
 
     @staticmethod
     def _compute_rows(loaded):
-        """Returns [(statistic_name, {sample_num: formatted_value}), ...]."""
+        """Returns [(statistic_name, {sample_num: formatted_value}), ...].
+
+        Values are derived from the per-sample lap extraction:
+          - Top speed: max of the speed column (km/h, integer).
+          - Fuel used: last value of the cumulative fuel_used array (kg).
+          - ERS delta: ers_pct[-1] − ers_pct[0] (percentage points, signed
+            — positive means the lap ended with more ERS than it started).
+        Cells fall back to "—" when the underlying signal is NaN (status
+        packet hadn't arrived yet at the relevant row).
+        """
+
+        def fuel_used(d):
+            v = d["fuel_used"][-1]
+            return "—" if pd.isna(v) else f"{float(v):.2f} kg"
+
+        def ers_delta(d):
+            ers = d["ers_pct"]
+            if pd.isna(ers[0]) or pd.isna(ers[-1]):
+                return "—"
+            return f"{float(ers[-1] - ers[0]):+.1f}%"
+
         return [
             (
                 "Top speed",
@@ -486,6 +506,8 @@ class StatsDialog(QDialog):
                     for n, d in loaded.items()
                 },
             ),
+            ("Fuel used", {n: fuel_used(d) for n, d in loaded.items()}),
+            ("ERS delta", {n: ers_delta(d) for n, d in loaded.items()}),
         ]
 
 
