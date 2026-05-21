@@ -17,9 +17,11 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
@@ -351,6 +353,16 @@ class ChartPanel(QWidget):
         vb.setLimits(yMin=y_min, yMax=y_max)
         self.plot_item.setYRange(y_min, y_max, padding=0)
 
+    def set_x_label(self, label):
+        """Set or hide the X-axis title. Used by MainWindow to keep the
+        label on whichever panel is currently bottom-most visible."""
+        axis = self.plot_item.getAxis("bottom")
+        if label:
+            axis.setLabel(label)
+            axis.showLabel(True)
+        else:
+            axis.showLabel(False)
+
     def show_cursor_x(self, x):
         self._cursor_line.setPos(x)
         self._cursor_line.setVisible(True)
@@ -477,6 +489,63 @@ class StatsDialog(QDialog):
         ]
 
 
+class ChartsSettingsDialog(QDialog):
+    """Modal dialog with a single "Charts" group of checkboxes — one per
+    available chart panel. The caller passes the current visibility state
+    and reads back the chosen state on accept(). At least one chart must
+    stay checked; up to ``MAX_SELECTED`` may be checked (the cap is here
+    in anticipation of more panels — with 6 it's unreachable today)."""
+
+    MAX_SELECTED = 6
+
+    def __init__(self, chart_specs, current_state, parent=None):
+        """``chart_specs`` is an ordered list of ``(key, label)`` tuples.
+        ``current_state`` is a ``{key: bool}`` mapping; missing keys default
+        to True."""
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+
+        self._checkboxes = {}
+        group = QGroupBox("Charts")
+        gl = QVBoxLayout(group)
+        for key, label in chart_specs:
+            cb = QCheckBox(label)
+            cb.setChecked(current_state.get(key, True))
+            cb.stateChanged.connect(self._refresh_constraints)
+            gl.addWidget(cb)
+            self._checkboxes[key] = cb
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self.accept)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(group)
+        layout.addLayout(btn_row)
+
+        self._refresh_constraints()
+
+    def _refresh_constraints(self, *_):
+        checked = [cb for cb in self._checkboxes.values() if cb.isChecked()]
+        unchecked = [cb for cb in self._checkboxes.values() if not cb.isChecked()]
+        for cb in self._checkboxes.values():
+            cb.setEnabled(True)
+        if len(checked) == 1:
+            checked[0].setEnabled(False)  # can't deselect the last one
+        if len(checked) >= self.MAX_SELECTED:
+            for cb in unchecked:
+                cb.setEnabled(False)  # cap on total selected
+
+    def get_state(self):
+        return {key: cb.isChecked() for key, cb in self._checkboxes.items()}
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -500,6 +569,10 @@ class MainWindow(QMainWindow):
 
         self.render_btn = QPushButton("Render")
         top.addWidget(self.render_btn)
+
+        self.settings_btn = QPushButton("Settings")
+        self.settings_btn.clicked.connect(self._on_settings_clicked)
+        top.addWidget(self.settings_btn)
 
         self.stats_btn = QPushButton("Stats")
         self.stats_btn.setEnabled(False)
@@ -546,7 +619,6 @@ class MainWindow(QMainWindow):
             y_label="ERS",
             y_range=(0, 110),
             y_ticks=[(v, str(v)) for v in (0, 20, 40, 60, 80, 100)],
-            x_label="Lap distance (m)",
         )
         self.delta_panel.link_x_to(self.input_panel)
         self.speed_panel.link_x_to(self.input_panel)
@@ -587,6 +659,30 @@ class MainWindow(QMainWindow):
         main_split.setStretchFactor(1, 1)
         root.addWidget(main_split, 1)
 
+        # Ordered (key, label) specs drive the Settings dialog and the
+        # X-label bottom-most-visible lookup. Order here also matches the
+        # splitter, so keep them in sync.
+        self._chart_specs = [
+            ("delta", "Delta"),
+            ("inputs", "Inputs"),
+            ("speed", "Speed"),
+            ("gear", "Gear"),
+            ("steering", "Steering"),
+            ("ers", "ERS"),
+        ]
+        self._chart_panels = {
+            "delta": self.delta_panel,
+            "inputs": self.input_panel,
+            "speed": self.speed_panel,
+            "gear": self.gear_panel,
+            "steering": self.steering_panel,
+            "ers": self.ers_panel,
+        }
+        self._chart_visibility = {key: True for key, _ in self._chart_specs}
+        # Whether the last _on_render actually produced delta data. The
+        # delta panel is shown only when the user wants it AND this is True.
+        self._delta_renderable = False
+
         self.delta_panel.setVisible(False)
 
         # Trajectory markers — solid filled circles, 2× the trajectory line
@@ -625,6 +721,36 @@ class MainWindow(QMainWindow):
         self._samples = {1: None, 2: None}
         self._downsample_hz = _load_viewer_settings().get("downsample_hz")
         self.render_btn.clicked.connect(self._on_render)
+
+        self._update_x_label()
+
+    def _on_settings_clicked(self):
+        dialog = ChartsSettingsDialog(
+            self._chart_specs, self._chart_visibility, parent=self
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._chart_visibility = dialog.get_state()
+            self._update_panel_visibility()
+
+    def _update_panel_visibility(self):
+        for key, panel in self._chart_panels.items():
+            wanted = self._chart_visibility.get(key, True)
+            if key == "delta":
+                # Delta has the data-side gate: it only makes sense when both
+                # samples are loaded and a delta curve was actually computed.
+                panel.setVisible(wanted and self._delta_renderable)
+            else:
+                panel.setVisible(wanted)
+        self._update_x_label()
+
+    def _update_x_label(self):
+        label = "Lap distance (m)"
+        bottom_visible = None
+        for panel in self._left_panels:
+            if panel.isVisible():
+                bottom_visible = panel
+        for panel in self._left_panels:
+            panel.set_x_label(label if panel is bottom_visible else None)
 
     def _update_stats_btn(self):
         has_data = any(
@@ -960,67 +1086,53 @@ class MainWindow(QMainWindow):
             marker.setVisible(False)
             self.trajectory_item.addItem(marker)
 
-        xs = [d["x"] for d in self._samples.values() if d is not None]
-        if not xs:
-            self.delta_panel.setVisible(False)
-            return
-        x_min = min(float(a.min()) for a in xs)
-        x_max = max(float(a.max()) for a in xs)
-        self.input_panel.set_x_range(x_min, x_max)
+        self._delta_renderable = False
 
-        max_speed = max(
-            float(np.max(d["speed"]))
-            for d in self._samples.values()
-            if d is not None
-        )
-        self.speed_panel.set_y_range(0, max_speed * 1.1)
+        xs = [d["x"] for d in self._samples.values() if d is not None]
+        if xs:
+            x_min = min(float(a.min()) for a in xs)
+            x_max = max(float(a.max()) for a in xs)
+            self.input_panel.set_x_range(x_min, x_max)
+
+            max_speed = max(
+                float(np.max(d["speed"]))
+                for d in self._samples.values()
+                if d is not None
+            )
+            self.speed_panel.set_y_range(0, max_speed * 1.1)
 
         s1 = self._samples[1]
         s2 = self._samples[2]
-        if s1 is None or s2 is None:
-            self.delta_panel.setVisible(False)
-            return
+        if s1 is not None and s2 is not None:
+            delta_x_min = max(float(s1["x"].min()), float(s2["x"].min()))
+            delta_x_max = min(float(s1["x"].max()), float(s2["x"].max()))
+            if delta_x_max > delta_x_min:
+                # Calibrated delta — see _calibrated_elapsed_time_ms.
+                t1_full = self._calibrated_elapsed_time_ms(s1)
+                t2_full = self._calibrated_elapsed_time_ms(s2)
 
-        delta_x_min = max(float(s1["x"].min()), float(s2["x"].min()))
-        delta_x_max = min(float(s1["x"].max()), float(s2["x"].max()))
-        if delta_x_max <= delta_x_min:
-            self.delta_panel.setVisible(False)
-            return
+                mask = (s1["x"] >= delta_x_min) & (s1["x"] <= delta_x_max)
+                x_common = s1["x"][mask]
+                if len(x_common) >= 2:
+                    t1 = t1_full[mask]
+                    t2 = np.interp(x_common, s2["x"], t2_full)
+                    delta_s = (t1 - t2) / 1000.0
 
-        # Calibrated delta. Each sample's time-vs-distance is reconstructed
-        # by integrating speed for shape, then anchored at sector boundaries
-        # (sector1_time, sector1_time + sector2_time) and lap end
-        # (lap_total_ms) — all game-authoritative, jitter-free stamps. The
-        # 3% bias of pure speed integration is absorbed into the per-sector
-        # linear stretch, so delta at S1, S2, and the finish line is exact
-        # to within ≤1 sample's worth of boundary-detection slop.
-        t1_full = self._calibrated_elapsed_time_ms(s1)
-        t2_full = self._calibrated_elapsed_time_ms(s2)
+                    max_abs = float(np.max(np.abs(delta_s)))
+                    if max_abs == 0:
+                        max_abs = 0.001
+                    y_lim = max_abs * 1.1
+                    self.delta_panel.set_y_range(-y_lim, y_lim)
+                    self.delta_panel.add_series(
+                        x_common,
+                        delta_s,
+                        pen=pg.mkPen("b", width=3),
+                        label="Δ",
+                        formatter=lambda v: f"{v:+.3f}s",
+                    )
+                    self._delta_renderable = True
 
-        mask = (s1["x"] >= delta_x_min) & (s1["x"] <= delta_x_max)
-        x_common = s1["x"][mask]
-        if len(x_common) < 2:
-            self.delta_panel.setVisible(False)
-            return
-
-        t1 = t1_full[mask]
-        t2 = np.interp(x_common, s2["x"], t2_full)
-        delta_s = (t1 - t2) / 1000.0
-
-        max_abs = float(np.max(np.abs(delta_s)))
-        if max_abs == 0:
-            max_abs = 0.001  # degenerate case — avoid an empty Y range
-        y_lim = max_abs * 1.1
-        self.delta_panel.set_y_range(-y_lim, y_lim)
-
-        self.delta_panel.add_series(
-            x_common,
-            delta_s,
-            pen=pg.mkPen("b", width=3),
-            label="Δ",
-            formatter=lambda v: f"{v:+.3f}s",
-        )
-        self.delta_panel.setVisible(True)
+        self._update_panel_visibility()
 
 
 def main():
