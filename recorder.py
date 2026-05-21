@@ -21,6 +21,7 @@ from datetime import datetime
 
 ROW_FIELDS = [
     "lap_num",
+    "lap_run",
     "brake",
     "throttle",
     "steer",
@@ -61,6 +62,20 @@ _WINDOWS_RESERVED = {
 }
 
 
+def _header_matches(path, expected_fields):
+    """Read the first CSV line and check it matches ``expected_fields`` exactly.
+
+    Returns False on any read failure — caller treats that the same as a real
+    mismatch and rotates the file aside rather than risking a corrupt append.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f), None)
+    except OSError:
+        return False
+    return header == list(expected_fields)
+
+
 def _sanitise_for_filename(name):
     """Replace filesystem-unsafe characters and collapse whitespace.
 
@@ -98,6 +113,26 @@ class Recorder:
         self._damage = [None] * 22
         self._participants = [None] * 22
 
+        # Per-driver flashback / load-from-save tracking. A regression in
+        # (lap_num, lap_distance) means the player rewound time, so the next
+        # pass over the same lap needs its own identity — we bump `_lap_run`
+        # and stamp it on every emitted row, letting the viewer treat the
+        # repeated lap as a separate lap instead of overlaying it.
+        self._last_position = [None] * 22
+        self._lap_run = [0] * 22
+        # Highest frame_id we've accepted per packet kind. UDP can reorder
+        # packets — a stale LAP packet would walk lap_distance backwards and
+        # mimic a flashback; stale telemetry/motion/status/damage would mix
+        # a previous frame's values into the next written row. We gate each
+        # ingestion on this so cached state never moves backwards in time.
+        self._last_frame_id = {
+            "motion": 0,
+            "lap": 0,
+            "telemetry": 0,
+            "status": 0,
+            "damage": 0,
+        }
+
     def _close_all(self):
         for f in self._files.values():
             try:
@@ -121,22 +156,45 @@ class Recorder:
         if had_session:
             self._track_name = None
             self._session_type_code = None
+        self._last_position = [None] * 22
+        self._lap_run = [0] * 22
+        self._last_frame_id = {k: 0 for k in self._last_frame_id}
+
+    def _fresh(self, kind, header):
+        """Accept-or-drop test for an incoming packet.
+
+        Returns True (and bumps the high-water mark) when the packet is
+        from the current session and not older than something we've already
+        processed for the same kind. Returns False for cross-session or
+        reordered packets so callers can drop them without further work.
+        """
+        if header["session_uid"] != self.session_uid:
+            return False
+        frame_id = header["frame_id"]
+        if frame_id < self._last_frame_id[kind]:
+            return False
+        self._last_frame_id[kind] = frame_id
+        return True
 
     def on_session(self, info):
         self._track_name = info["track_name"]
         self._session_type_code = info["session_type_code"]
 
-    def on_motion(self, samples):
-        self._motion = samples
+    def on_motion(self, header, samples):
+        if self._fresh("motion", header):
+            self._motion = samples
 
-    def on_lap(self, samples):
-        self._lap = samples
+    def on_lap(self, header, samples):
+        if self._fresh("lap", header):
+            self._lap = samples
 
-    def on_car_status(self, samples):
-        self._status = samples
+    def on_car_status(self, header, samples):
+        if self._fresh("status", header):
+            self._status = samples
 
-    def on_car_damage(self, samples):
-        self._damage = samples
+    def on_car_damage(self, header, samples):
+        if self._fresh("damage", header):
+            self._damage = samples
 
     def on_participants(self, samples):
         self._participants = samples
@@ -160,6 +218,23 @@ class Recorder:
             existed = os.path.exists(path) and os.path.getsize(path) > 0
         except OSError:
             existed = False  # treat unreadable stat as "new" — open() will fail loudly if it really can't be touched
+
+        if existed and not _header_matches(path, ROW_FIELDS):
+            # An older recorder build wrote this file with a different column
+            # set. Appending now would interleave row shapes and silently
+            # corrupt the CSV, so rotate the old file aside and start fresh.
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            legacy_path = f"{path}.legacy_{stamp}.csv"
+            try:
+                os.rename(path, legacy_path)
+                print(f"[recorder] schema changed, moved old file to {legacy_path}",
+                      flush=True)
+                existed = False
+            except OSError as e:
+                print(f"[recorder] schema mismatch on {path} and could not rotate: {e}",
+                      file=sys.stderr, flush=True)
+                self._skip.add(driver_index)
+                return None
 
         try:
             # Append mode + line buffering: each row is flushed on write, so a
@@ -210,6 +285,12 @@ class Recorder:
             self._reset_session(session_uid)
         if not self._track_name or not self._session_type_code:
             return  # waiting for Session packet — usually <0.5 s after start
+        # Drop stale telemetry packets so we don't emit a row whose
+        # brake/throttle/etc. come from an older frame than the LAP/MOTION
+        # state we'd pair them with. Runs *after* the session reset so the
+        # first packet of a new session passes (high-water mark is 0).
+        if not self._fresh("telemetry", header):
+            return
 
         for i, telem in enumerate(samples):
             participant = self._participants[i]
@@ -227,12 +308,31 @@ class Recorder:
             status = self._status[i]
             damage = self._damage[i]
 
+            if lap is not None:
+                lap_num = lap["lap_num"]
+                lap_distance = lap["lap_distance"]
+                last = self._last_position[i]
+                if last is not None:
+                    last_num, last_dist = last
+                    # Time moved backwards = flashback or load-from-save.
+                    # Crossing start/finish also resets lap_distance, but
+                    # lap_num bumps up at the same time so it doesn't match.
+                    # The 1m slack absorbs minor lap_distance jitter near
+                    # the line without missing a real rewind (always tens
+                    # of metres at least).
+                    if lap_num < last_num or (
+                        lap_num == last_num and lap_distance < last_dist - 1.0
+                    ):
+                        self._lap_run[i] += 1
+                self._last_position[i] = (lap_num, lap_distance)
+
             surface = telem["tire_surface_temp"]
             inner = telem["tire_inner_temp"]
             wear = damage["tire_wear"] if damage else (None, None, None, None)
 
             row = {
                 "lap_num": lap["lap_num"] if lap else "",
+                "lap_run": self._lap_run[i],
                 "brake": f"{telem['brake']:.2f}",
                 "throttle": f"{telem['throttle']:.2f}",
                 "steer": f"{telem['steer']:.2f}",

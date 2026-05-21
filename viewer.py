@@ -97,14 +97,46 @@ class SampleLoader(QWidget):
             self.lap_combo.setEnabled(False)
             return
 
+        # lap_run distinguishes the original pass through a lap from any
+        # replays the game produced after a flashback / load-from-save (same
+        # lap_num, second life). Old recorders didn't emit it — fall back to
+        # lap_num-only grouping so existing CSVs still open.
+        has_run = "lap_run" in self._df.columns
+        group_cols = ["lap_num", "lap_run"] if has_run else ["lap_num"]
         # Lap time per lap = max running timer seen during that lap. The timer
         # resets to 0 on each new lap, so its peak is the lap's final reading.
-        grouped = self._df.groupby("lap_num")["lap_time"].max().sort_index()
-        for lap_num, lap_ms in grouped.items():
-            if pd.isna(lap_num):
+        grouped = self._df.groupby(group_cols)["lap_time"].max().sort_index()
+
+        if not has_run:
+            for lap_num, lap_ms in grouped.items():
+                if pd.isna(lap_num):
+                    continue
+                text = f"#{int(lap_num)} {_format_lap_time_ms(lap_ms)}"
+                self.lap_combo.addItem(text, userData=(int(lap_num), None))
+            self.lap_combo.setEnabled(self.lap_combo.count() > 0)
+            return
+
+        # Re-number runs per-lap starting from 1, so users see "(run 1) /
+        # (run 2)" instead of the raw global counter (which can skip values
+        # when a flashback lands in the middle of a different lap).
+        runs_per_lap = {}
+        for lap_num, lap_run in grouped.index:
+            if pd.isna(lap_num) or pd.isna(lap_run):
                 continue
-            text = f"#{int(lap_num)} {_format_lap_time_ms(lap_ms)}"
-            self.lap_combo.addItem(text, userData=int(lap_num))
+            runs_per_lap[int(lap_num)] = runs_per_lap.get(int(lap_num), 0) + 1
+
+        display_index = {}
+        for (lap_num, lap_run), lap_ms in grouped.items():
+            if pd.isna(lap_num) or pd.isna(lap_run):
+                continue
+            ln = int(lap_num)
+            lr = int(lap_run)
+            display_index[ln] = display_index.get(ln, 0) + 1
+            if runs_per_lap[ln] > 1:
+                text = f"#{ln} (run {display_index[ln]}) {_format_lap_time_ms(lap_ms)}"
+            else:
+                text = f"#{ln} {_format_lap_time_ms(lap_ms)}"
+            self.lap_combo.addItem(text, userData=(ln, lr))
 
         self.lap_combo.setEnabled(self.lap_combo.count() > 0)
 
@@ -494,10 +526,14 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _extract_lap(sample):
         df = sample._df
-        lap = sample.lap_combo.currentData()
-        if df is None or lap is None:
+        selection = sample.lap_combo.currentData()
+        if df is None or selection is None:
             return None
-        lap_df = df[(df["lap_num"] == lap) & (df["lap_distance"] >= 0)]
+        lap, lap_run = selection
+        lap_df = df[df["lap_num"] == lap]
+        if lap_run is not None and "lap_run" in df.columns:
+            lap_df = lap_df[lap_df["lap_run"] == lap_run]
+        lap_df = lap_df[lap_df["lap_distance"] >= 0]
         # Drop pre-session capture artifacts: rows where the car is parked at
         # the start line (lap_distance == 0 AND speed == 0) while lap_time
         # ticks up. F1 25 emits these when the recorder runs during the

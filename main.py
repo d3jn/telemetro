@@ -67,13 +67,13 @@ def main():
                 if pid == packets.PACKET_CAR_TELEMETRY:
                     recorder.on_car_telemetry(header, packets.parse_car_telemetry(data))
                 elif pid == packets.PACKET_MOTION:
-                    recorder.on_motion(packets.parse_motion(data))
+                    recorder.on_motion(header, packets.parse_motion(data))
                 elif pid == packets.PACKET_LAP:
-                    recorder.on_lap(packets.parse_lap(data))
+                    recorder.on_lap(header, packets.parse_lap(data))
                 elif pid == packets.PACKET_CAR_STATUS:
-                    recorder.on_car_status(packets.parse_car_status(data))
+                    recorder.on_car_status(header, packets.parse_car_status(data))
                 elif pid == packets.PACKET_CAR_DAMAGE:
-                    recorder.on_car_damage(packets.parse_car_damage(data))
+                    recorder.on_car_damage(header, packets.parse_car_damage(data))
                 elif pid == packets.PACKET_PARTICIPANTS:
                     recorder.on_participants(packets.parse_participants(data))
                 elif pid == packets.PACKET_SESSION:
