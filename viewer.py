@@ -620,11 +620,16 @@ class MainWindow(QMainWindow):
             y_range=(0, 110),
             y_ticks=[(v, str(v)) for v in (0, 20, 40, 60, 80, 100)],
         )
+        self.fuel_panel = ChartPanel(
+            y_label="Fuel used (kg)",
+            y_range=(0, 5),  # placeholder; recomputed per-render from data
+        )
         self.delta_panel.link_x_to(self.input_panel)
         self.speed_panel.link_x_to(self.input_panel)
         self.gear_panel.link_x_to(self.input_panel)
         self.steering_panel.link_x_to(self.input_panel)
         self.ers_panel.link_x_to(self.input_panel)
+        self.fuel_panel.link_x_to(self.input_panel)
 
         chart_stack = QSplitter(Qt.Orientation.Vertical)
         chart_stack.addWidget(self.delta_panel)
@@ -633,12 +638,14 @@ class MainWindow(QMainWindow):
         chart_stack.addWidget(self.gear_panel)
         chart_stack.addWidget(self.steering_panel)
         chart_stack.addWidget(self.ers_panel)
+        chart_stack.addWidget(self.fuel_panel)
         chart_stack.setStretchFactor(0, 1)
         chart_stack.setStretchFactor(1, 3)
         chart_stack.setStretchFactor(2, 2)
         chart_stack.setStretchFactor(3, 2)
         chart_stack.setStretchFactor(4, 2)
         chart_stack.setStretchFactor(5, 2)
+        chart_stack.setStretchFactor(6, 2)
 
         # Trajectory: free pan/zoom, square aspect ratio so the track isn't
         # distorted. Deliberately not part of the linked X group on the left.
@@ -669,6 +676,7 @@ class MainWindow(QMainWindow):
             ("gear", "Gear"),
             ("steering", "Steering"),
             ("ers", "ERS"),
+            ("fuel", "Fuel"),
         ]
         self._chart_panels = {
             "delta": self.delta_panel,
@@ -677,8 +685,13 @@ class MainWindow(QMainWindow):
             "gear": self.gear_panel,
             "steering": self.steering_panel,
             "ers": self.ers_panel,
+            "fuel": self.fuel_panel,
         }
+        # All on by default except fuel — keeps the historical layout intact
+        # for users who don't care about fuel.
         self._chart_visibility = {key: True for key, _ in self._chart_specs}
+        self._chart_visibility["fuel"] = False
+        self.fuel_panel.setVisible(False)
         # Whether the last _on_render actually produced delta data. The
         # delta panel is shown only when the user wants it AND this is True.
         self._delta_renderable = False
@@ -713,6 +726,7 @@ class MainWindow(QMainWindow):
             self.gear_panel,
             self.steering_panel,
             self.ers_panel,
+            self.fuel_panel,
         )
         for panel in self._left_panels:
             panel.x_hovered.connect(self._on_chart_x_hovered)
@@ -929,6 +943,11 @@ class MainWindow(QMainWindow):
             # Game-authoritative total from the next block's last_lap_time;
             # None when the recording ended before the line crossing.
             "lap_total_ms": float(lap_total_ms) if lap_total_ms else None,
+            # Cumulative fuel consumed since the first row of this lap. Uses
+            # the first row's fuel_level as the baseline so the chart starts
+            # at 0 even when the sample is missing rows near lap_distance=0.
+            "fuel_used": float(lap_df["fuel_level"].iloc[0])
+            - lap_df["fuel_level"].to_numpy(),
         }
 
     def _add_ers_series(self, sample_num, data, ers_pens):
@@ -982,6 +1001,7 @@ class MainWindow(QMainWindow):
         self.gear_panel.clear()
         self.steering_panel.clear()
         self.ers_panel.clear()
+        self.fuel_panel.clear()
         self.trajectory_item.clear()
 
         input_pens = {
@@ -1009,6 +1029,10 @@ class MainWindow(QMainWindow):
         steering_pens = {
             1: pg.mkPen((160, 32, 240), width=3),
             2: pg.mkPen((210, 160, 240), width=3, style=Qt.PenStyle.DashLine),
+        }
+        fuel_pens = {
+            1: pg.mkPen((218, 165, 32), width=3),
+            2: pg.mkPen((240, 210, 130), width=3, style=Qt.PenStyle.DashLine),
         }
         # (sample_num, ers_mode) → pen. modes: 0=none, 1=medium, 2=hotlap, 3=overtake.
         ers_pens = {
@@ -1064,6 +1088,14 @@ class MainWindow(QMainWindow):
                 label="Steer",
                 sample_num=sample_num,
             )
+            self.fuel_panel.add_series(
+                data["x"],
+                data["fuel_used"],
+                pen=fuel_pens[sample_num],
+                label="Fuel",
+                sample_num=sample_num,
+                formatter=lambda v: f"{v:.2f} kg",
+            )
             self._add_ers_series(sample_num, data, ers_pens)
 
             wx = data["world_x"]
@@ -1100,6 +1132,15 @@ class MainWindow(QMainWindow):
                 if d is not None
             )
             self.speed_panel.set_y_range(0, max_speed * 1.1)
+
+            max_fuel = max(
+                float(np.max(d["fuel_used"]))
+                for d in self._samples.values()
+                if d is not None
+            )
+            if max_fuel <= 0:
+                max_fuel = 0.1  # avoid an empty Y range
+            self.fuel_panel.set_y_range(0, max_fuel * 1.1)
 
         s1 = self._samples[1]
         s2 = self._samples[2]
