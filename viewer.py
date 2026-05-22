@@ -10,6 +10,14 @@ import json
 import os
 import sys
 
+# pyqtgraph picks its Qt binding at import time, scanning PyQt5 → PySide2 →
+# PyQt6 → PySide6 and taking the first one installed. On Windows builds PyQt
+# tends to be present (often as a transitive dep), so pyqtgraph binds to it
+# instead of the PySide6 we use everywhere else — two Qt bindings loaded in
+# one process crashes on the first widget. Forcing the choice here keeps the
+# bindings consistent. Must be set before `import pyqtgraph`.
+os.environ["PYQTGRAPH_QT_LIB"] = "PySide6"
+
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
