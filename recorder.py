@@ -10,6 +10,19 @@ raises out of `on_*` so the UDP loop keeps running.
 
 Restricted drivers (m_yourTelemetry == 0) are skipped — the game zeroes their
 Motion + Car Telemetry, so we cannot tell "parked at origin" from "no data".
+
+The CSV layout is the same whichever UDP format (2025 or 2026) was recorded, and
+covers both regulation sets:
+
+    regs             2025 or 2026 — the rules this car runs under. Not the wire
+                     format: the 2026 format carries pre-2026 cars too.
+    low_drag         1 while the wing is in its low-drag state: DRS open on 2025
+                     cars, Active Aero straight mode on 2026 cars.
+    overtake_active  2026 Overtake Mode, 0/1. Blank on 2025 cars, which have no
+                     equivalent.
+    ers_store        ERS store energy in Joules. Raw on purpose: store capacity
+                     is a regulation detail the viewer owns.
+    ers_mode         Raw deploy mode, see telemetry.ERS_MODES.
 """
 
 import csv
@@ -18,16 +31,21 @@ import re
 import sys
 from datetime import datetime
 
+from telemetry import REGS_2026
+
 
 ROW_FIELDS = [
     "lap_num",
     "lap_run",
+    "regs",
     "brake",
     "throttle",
     "steer",
     "gear",
     "speed",
-    "ers_pct",
+    "low_drag",
+    "overtake_active",
+    "ers_store",
     "ers_mode",
     "fuel_level",
     "tire_wear_rl",
@@ -94,8 +112,13 @@ def _sanitise_for_filename(name):
 
 
 class Recorder:
-    def __init__(self, output_dir):
+    def __init__(self, output_dir, num_cars, regs):
+        """``num_cars`` is the per-car array length of the UDP format being
+        recorded. ``regs`` is the regulation set every car in that format runs
+        under, or None when it varies per car and arrives in Car Telemetry 2."""
         self.output_dir = output_dir
+        self.num_cars = num_cars
+        self._regs = regs
         try:
             os.makedirs(output_dir, exist_ok=True)
         except OSError as e:
@@ -110,19 +133,20 @@ class Recorder:
         self._writers = {}              # driver_index -> csv.DictWriter
         self._skip = set()              # drivers we have given up on this session
 
-        self._motion = [None] * 22
-        self._lap = [None] * 22
-        self._status = [None] * 22
-        self._damage = [None] * 22
-        self._participants = [None] * 22
+        self._motion = [None] * num_cars
+        self._lap = [None] * num_cars
+        self._status = [None] * num_cars
+        self._damage = [None] * num_cars
+        self._telemetry2 = [None] * num_cars
+        self._participants = [None] * num_cars
 
         # Per-driver flashback / load-from-save tracking. A regression in
         # (lap_num, lap_distance) means the player rewound time, so the next
         # pass over the same lap needs its own identity — we bump `_lap_run`
         # and stamp it on every emitted row, letting the viewer treat the
         # repeated lap as a separate lap instead of overlaying it.
-        self._last_position = [None] * 22
-        self._lap_run = [0] * 22
+        self._last_position = [None] * num_cars
+        self._lap_run = [0] * num_cars
         # Highest frame_id we've accepted per packet kind. UDP can reorder
         # packets — a stale LAP packet would walk lap_distance backwards and
         # mimic a flashback; stale telemetry/motion/status/damage would mix
@@ -134,6 +158,7 @@ class Recorder:
             "telemetry": 0,
             "status": 0,
             "damage": 0,
+            "telemetry2": 0,
         }
 
     def _close_all(self):
@@ -159,8 +184,8 @@ class Recorder:
         if had_session:
             self._track_name = None
             self._session_type_code = None
-        self._last_position = [None] * 22
-        self._lap_run = [0] * 22
+        self._last_position = [None] * self.num_cars
+        self._lap_run = [0] * self.num_cars
         self._last_frame_id = {k: 0 for k in self._last_frame_id}
 
     def _fresh(self, kind, header):
@@ -198,6 +223,10 @@ class Recorder:
     def on_car_damage(self, header, samples):
         if self._fresh("damage", header):
             self._damage = samples
+
+    def on_car_telemetry2(self, header, samples):
+        if self._fresh("telemetry2", header):
+            self._telemetry2 = samples
 
     def on_participants(self, samples):
         self._participants = samples
@@ -302,6 +331,11 @@ class Recorder:
             if participant["your_telemetry"] == 0:
                 continue
 
+            aero = self._aero(telem, self._telemetry2[i])
+            if aero is None:
+                continue  # regs unknown until this car's first Car Telemetry 2 packet
+            regs, low_drag, overtake_active = aero
+
             writer = self._writer_for(i, participant["name"])
             if writer is None:
                 continue
@@ -336,12 +370,15 @@ class Recorder:
             row = {
                 "lap_num": lap["lap_num"] if lap else "",
                 "lap_run": self._lap_run[i],
+                "regs": regs,
                 "brake": f"{telem['brake']:.2f}",
                 "throttle": f"{telem['throttle']:.2f}",
                 "steer": f"{telem['steer']:.2f}",
                 "gear": telem["gear"],
                 "speed": telem["speed"],
-                "ers_pct": f"{status['ers_pct']:.2f}" if status else "",
+                "low_drag": low_drag,
+                "overtake_active": overtake_active,
+                "ers_store": f"{status['ers_store']:.0f}" if status else "",
                 "ers_mode": status["ers_mode"] if status else "",
                 "fuel_level": f"{status['fuel_in_tank']:.3f}" if status else "",
                 "tire_wear_rl": f"{wear[0]:.3f}" if wear[0] is not None else "",
@@ -371,6 +408,25 @@ class Recorder:
                 print(f"[recorder] write failed for driver {i}: {e}",
                       file=sys.stderr, flush=True)
                 self._drop_driver(i)
+
+    def _aero(self, telem, telem2):
+        """Resolve one car's (regs, low_drag, overtake_active), or None while
+        its regulation set is still unknown.
+
+        This is where the 2025 and 2026 rules are folded into one set of
+        columns: the low-drag wing state is DRS on pre-2026 cars and Active Aero
+        straight mode on 2026 cars, and only 2026 cars have Overtake Mode.
+        """
+        regs = self._regs
+        if regs is None:
+            if telem2 is None:
+                return None
+            regs = telem2["regs"]
+        if regs == REGS_2026:
+            if telem2 is None:
+                return None
+            return regs, telem2["active_aero_mode"], telem2["overtake_active"]
+        return regs, telem["drs"], ""
 
     def close(self):
         self._close_all()

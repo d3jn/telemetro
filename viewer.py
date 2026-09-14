@@ -42,6 +42,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from recorder import ROW_FIELDS
+
+
+# ERS store capacity per regulation set, keyed by the CSV `regs` column. The
+# recorder writes raw Joules so this is the only place the capacity lives. The
+# 2026 value is an assumption — the 2026 Season Pack spec does not state it.
+ERS_STORE_MAX_J = {2025: 4_000_000.0, 2026: 4_000_000.0}
+
+# Aero panel lanes: each on/off signal is drawn in its own band so the two
+# never overlap. (off_y, on_y) per signal.
+AERO_LANES = {"low_drag": (0.0, 0.8), "overtake_active": (1.2, 2.0)}
+
 
 def _base_dir():
     if getattr(sys, "frozen", False):
@@ -67,9 +79,9 @@ def _downsample_lap_df(lap_df, target_hz):
     Estimates the source rate from the median ``lap_time`` interval, then
     bins every ``round(source_hz / target_hz)`` consecutive rows. Continuous
     columns are averaged (smoothing the trace); discrete columns (gear,
-    ers_mode, lap_num) take the first value of each bin so step renders and
-    integer tooltips stay sensible. Pure in-memory — the source CSV is not
-    touched.
+    ers_mode, lap_num, regs, aero flags) take the first value of each bin so
+    step renders and integer tooltips stay sensible. Pure in-memory — the
+    source CSV is not touched.
     """
     if target_hz is None or target_hz <= 0:
         return lap_df
@@ -87,7 +99,10 @@ def _downsample_lap_df(lap_df, target_hz):
         return lap_df
 
     bins = np.arange(len(lap_df)) // bin_size
-    first_cols = ("gear", "ers_mode", "lap_num", "lap_run", "sector_idx")
+    first_cols = (
+        "gear", "ers_mode", "lap_num", "lap_run", "sector_idx",
+        "regs", "low_drag", "overtake_active",
+    )
     # sector1_time / sector2_time / last_lap_time are 0 then latched to a
     # game-stamped value; max() preserves the latch through bin boundaries
     # rather than smearing the 0→value transition with a mean.
@@ -156,6 +171,12 @@ class SampleLoader(QWidget):
 
         try:
             df = pd.read_csv(path)
+            missing = [c for c in ROW_FIELDS if c not in df.columns]
+            if missing:
+                raise ValueError(
+                    "not a recording in the current format (older recorder "
+                    f"build?). Missing columns: {', '.join(missing)}"
+                )
         except Exception as e:
             self._df = None
             self._path = None
@@ -654,12 +675,23 @@ class MainWindow(QMainWindow):
             y_label="Fuel used (kg)",
             y_range=(0, 5),  # placeholder; recomputed per-render from data
         )
+        # Low-drag wing state (DRS on 2025 cars, Active Aero straight mode on
+        # 2026 cars) and 2026 Overtake Mode, each in its own lane.
+        self.aero_panel = ChartPanel(
+            y_label="Aero",
+            y_range=(-0.3, 2.3),
+            y_ticks=[
+                (sum(AERO_LANES["low_drag"]) / 2, "Low drag"),
+                (sum(AERO_LANES["overtake_active"]) / 2, "Overtake"),
+            ],
+        )
         self.delta_panel.link_x_to(self.input_panel)
         self.speed_panel.link_x_to(self.input_panel)
         self.gear_panel.link_x_to(self.input_panel)
         self.steering_panel.link_x_to(self.input_panel)
         self.ers_panel.link_x_to(self.input_panel)
         self.fuel_panel.link_x_to(self.input_panel)
+        self.aero_panel.link_x_to(self.input_panel)
 
         chart_stack = QSplitter(Qt.Orientation.Vertical)
         chart_stack.addWidget(self.delta_panel)
@@ -669,6 +701,7 @@ class MainWindow(QMainWindow):
         chart_stack.addWidget(self.steering_panel)
         chart_stack.addWidget(self.ers_panel)
         chart_stack.addWidget(self.fuel_panel)
+        chart_stack.addWidget(self.aero_panel)
         chart_stack.setStretchFactor(0, 1)
         chart_stack.setStretchFactor(1, 3)
         chart_stack.setStretchFactor(2, 2)
@@ -676,6 +709,7 @@ class MainWindow(QMainWindow):
         chart_stack.setStretchFactor(4, 2)
         chart_stack.setStretchFactor(5, 2)
         chart_stack.setStretchFactor(6, 2)
+        chart_stack.setStretchFactor(7, 1)
 
         # Trajectory: free pan/zoom, square aspect ratio so the track isn't
         # distorted. Deliberately not part of the linked X group on the left.
@@ -707,6 +741,7 @@ class MainWindow(QMainWindow):
             ("steering", "Steering"),
             ("ers", "ERS"),
             ("fuel", "Fuel"),
+            ("aero", "Aero"),
         ]
         self._chart_panels = {
             "delta": self.delta_panel,
@@ -716,12 +751,14 @@ class MainWindow(QMainWindow):
             "steering": self.steering_panel,
             "ers": self.ers_panel,
             "fuel": self.fuel_panel,
+            "aero": self.aero_panel,
         }
-        # All on by default except fuel — keeps the historical layout intact
-        # for users who don't care about fuel.
+        # All on by default except fuel and aero — keeps the historical layout
+        # intact for users who don't care about them.
         self._chart_visibility = {key: True for key, _ in self._chart_specs}
-        self._chart_visibility["fuel"] = False
-        self.fuel_panel.setVisible(False)
+        for key in ("fuel", "aero"):
+            self._chart_visibility[key] = False
+            self._chart_panels[key].setVisible(False)
         # Whether the last _on_render actually produced delta data. The
         # delta panel is shown only when the user wants it AND this is True.
         self._delta_renderable = False
@@ -757,6 +794,7 @@ class MainWindow(QMainWindow):
             self.steering_panel,
             self.ers_panel,
             self.fuel_panel,
+            self.aero_panel,
         )
         for panel in self._left_panels:
             panel.x_hovered.connect(self._on_chart_x_hovered)
@@ -955,8 +993,15 @@ class MainWindow(QMainWindow):
             "throttle": lap_df["throttle"].to_numpy(),
             "brake": lap_df["brake"].to_numpy(),
             "lap_time": lap_df["lap_time"].to_numpy(),
-            "ers_pct": lap_df["ers_pct"].to_numpy(),
+            # Rows whose regs has no known capacity map to NaN and drop out of
+            # the ERS chart rather than plotting against a guessed maximum.
+            "ers_pct": (
+                lap_df["ers_store"] / lap_df["regs"].map(ERS_STORE_MAX_J) * 100.0
+            ).to_numpy(dtype=float),
             "ers_mode": lap_df["ers_mode"].to_numpy(),
+            "low_drag": lap_df["low_drag"].to_numpy(dtype=float),
+            # NaN on 2025-regs cars, which have no Overtake Mode.
+            "overtake_active": lap_df["overtake_active"].to_numpy(dtype=float),
             "speed": lap_df["speed"].to_numpy(),
             "gear": lap_df["gear"].to_numpy(),
             # F1 25 reports steer as positive-right / negative-left. Flip
@@ -1019,6 +1064,29 @@ class MainWindow(QMainWindow):
                 start = i
         _emit(start, n)
 
+    def _add_aero_series(self, sample_num, data, aero_pens):
+        """Plot each on/off aero signal as a staircase in its own lane.
+
+        Rows without a value (Overtake Mode on 2025-regs cars) are dropped, so
+        a signal the car does not have draws nothing instead of a flat "off".
+        """
+        labels = {"low_drag": "Low drag", "overtake_active": "Overtake"}
+        for key, (off_y, on_y) in AERO_LANES.items():
+            values = data[key]
+            valid = ~np.isnan(values)
+            if not valid.any():
+                continue
+            mid = (off_y + on_y) / 2
+            self.aero_panel.add_series(
+                data["x"][valid],
+                np.where(values[valid] > 0, on_y, off_y),
+                pen=aero_pens[(sample_num, key)],
+                label=labels[key],
+                sample_num=sample_num,
+                formatter=lambda v, mid=mid: "on" if v > mid else "off",
+                step=True,
+            )
+
     def _on_render(self):
         self._samples = {
             1: self._extract_lap(self.sample1),
@@ -1032,6 +1100,7 @@ class MainWindow(QMainWindow):
         self.steering_panel.clear()
         self.ers_panel.clear()
         self.fuel_panel.clear()
+        self.aero_panel.clear()
         self.trajectory_item.clear()
 
         input_pens = {
@@ -1064,7 +1133,18 @@ class MainWindow(QMainWindow):
             1: pg.mkPen((218, 165, 32), width=3),
             2: pg.mkPen((240, 210, 130), width=3, style=Qt.PenStyle.DashLine),
         }
-        # (sample_num, ers_mode) → pen. modes: 0=none, 1=medium, 2=hotlap, 3=overtake.
+        aero_pens = {
+            (1, "low_drag"): pg.mkPen((0, 150, 136), width=3),
+            (1, "overtake_active"): pg.mkPen((200, 0, 120), width=3),
+            (2, "low_drag"): pg.mkPen(
+                (128, 203, 196), width=3, style=Qt.PenStyle.DashLine
+            ),
+            (2, "overtake_active"): pg.mkPen(
+                (230, 140, 190), width=3, style=Qt.PenStyle.DashLine
+            ),
+        }
+        # (sample_num, ers_mode) → pen. modes: 0=none, 1=medium, 2=hotlap,
+        # 3=boost (called "overtake" in the 2025 spec; same mode).
         ers_pens = {
             (1, 0): pg.mkPen((128, 128, 128), width=3),
             (1, 1): pg.mkPen((0, 180, 0), width=3),
@@ -1127,6 +1207,7 @@ class MainWindow(QMainWindow):
                 formatter=lambda v: f"{v:.2f} kg",
             )
             self._add_ers_series(sample_num, data, ers_pens)
+            self._add_aero_series(sample_num, data, aero_pens)
 
             wx = data["world_x"]
             wz = data["world_z"]
