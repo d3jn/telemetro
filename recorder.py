@@ -23,6 +23,13 @@ covers both regulation sets:
     ers_store        ERS store energy in Joules. Raw on purpose: store capacity
                      is a regulation detail the viewer owns.
     ers_mode         Raw deploy mode, see telemetry.ERS_MODES.
+    yaw              Heading in radians, wrapping at +/-pi.
+    motion_time      Session time in seconds of the Motion packet that world_x,
+                     world_z and yaw came from. Rows are written per Car
+                     Telemetry packet, so two rows can repeat one Motion packet;
+                     differentiate yaw against motion_time after dropping
+                     repeated motion_time values, not against lap_time, which
+                     comes from the Lap packet.
 """
 
 import csv
@@ -62,6 +69,8 @@ ROW_FIELDS = [
     "tire_temp_inner_fr",
     "world_x",
     "world_z",
+    "yaw",
+    "motion_time",
     "lap_time",
     "lap_distance",
     "last_lap_time",
@@ -134,6 +143,7 @@ class Recorder:
         self._skip = set()              # drivers we have given up on this session
 
         self._motion = [None] * num_cars
+        self._motion_time = None        # header session_time of self._motion
         self._lap = [None] * num_cars
         self._status = [None] * num_cars
         self._damage = [None] * num_cars
@@ -211,6 +221,7 @@ class Recorder:
     def on_motion(self, header, samples):
         if self._fresh("motion", header):
             self._motion = samples
+            self._motion_time = header["session_time"]
 
     def on_lap(self, header, samples):
         if self._fresh("lap", header):
@@ -395,6 +406,11 @@ class Recorder:
                 "tire_temp_inner_fr": inner[3],
                 "world_x": f"{motion['world_x']:.3f}" if motion else "",
                 "world_z": f"{motion['world_z']:.3f}" if motion else "",
+                "yaw": f"{motion['yaw']:.5f}" if motion else "",
+                # 4 decimals: the float32 session time keeps ~0.25 ms
+                # resolution for the first hour, and one frame at 60 Hz is
+                # ~16.7 ms, so 3 decimals would already blur dt by ~6%.
+                "motion_time": f"{self._motion_time:.4f}" if motion else "",
                 "lap_time": lap["lap_time_ms"] if lap else "",
                 "lap_distance": f"{lap['lap_distance']:.2f}" if lap else "",
                 "last_lap_time": lap["last_lap_time_ms"] if lap else "",

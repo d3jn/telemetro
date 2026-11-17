@@ -99,18 +99,19 @@ FORMATS = [F2025, F2026]
 
 # --- packet builders ----------------------------------------------------------
 
-def header(fmt, packet_id, session_uid=0xABCD, frame=99, player_idx=0):
+def header(fmt, packet_id, session_uid=0xABCD, frame=99, player_idx=0, session_time=12.5):
     return struct.pack(HEADER, fmt.packet_format, int(fmt.name) % 100, 1, 5, 1,
-                       packet_id, session_uid, 12.5, frame, frame, player_idx, 255)
+                       packet_id, session_uid, session_time, frame, frame, player_idx, 255)
 
 
 def per_car(fmt, entries, default):
     return b"".join(entries.get(i, default) for i in range(fmt.num_cars))
 
 
-def motion_car(fmt, pos=(0.0, 0.0, 0.0)):
+def motion_car(fmt, pos=(0.0, 0.0, 0.0), yaw=0.0):
+    # Pitch and roll get their own values so a wrong yaw index cannot pass.
     return struct.pack(MOTION[fmt.name], *pos, 0.0, 0.0, 0.0, 0, 0, 32767, 32767, 0, 0,
-                       1, 2, 3, 0.0, 0.0, 0.0)
+                       1, 2, 3, yaw, 0.25, -0.5)
 
 
 def motion_packet(fmt, cars=None, **kw):
@@ -243,9 +244,10 @@ class ParseTest(unittest.TestCase):
     def test_motion(self):
         for fmt in FORMATS:
             last = fmt.num_cars - 1
-            cars = payload(fmt, motion_packet(fmt, {last: motion_car(fmt, (1.5, -2.0, 3.25))}))
+            cars = payload(fmt, motion_packet(
+                fmt, {last: motion_car(fmt, (1.5, -2.0, 3.25), yaw=-3.125)}))
             self.assertEqual(len(cars), fmt.num_cars)
-            self.assertEqual(cars[last], {"world_x": 1.5, "world_z": 3.25})
+            self.assertEqual(cars[last], {"world_x": 1.5, "world_z": 3.25, "yaw": -3.125})
 
     def test_lap(self):
         for fmt in FORMATS:
@@ -430,8 +432,11 @@ class RecorderTest(unittest.TestCase):
             fmt, {i: participant(fmt, n.encode()) for i, n in drivers.items()}, frame=1))
         for frame in range(2, 2 + frames):
             car_idx = list(drivers)
+            # Motion session time differs from every other header's 12.5, so a
+            # row stamped from the wrong packet shows up.
             self.feed(recorder, fmt, motion_packet(
-                fmt, {i: motion_car(fmt, (10.0, 0.0, 20.0)) for i in car_idx}, frame=frame))
+                fmt, {i: motion_car(fmt, (10.0, 0.0, 20.0), yaw=1.5) for i in car_idx},
+                frame=frame, session_time=100.0 + frame / 64))
             self.feed(recorder, fmt, lap_packet(
                 fmt, {i: lap_entry(lap_distance=100.0 * frame, lap_num=2) for i in car_idx},
                 frame=frame))
@@ -459,6 +464,14 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(row["ers_mode"], "3")
         self.assertEqual(row["speed"], "250")
         self.assertEqual(row["world_z"], "20.000")
+        self.assertEqual(row["yaw"], "1.50000")
+        self.assertEqual(row["motion_time"], "100.0312")   # 100 + 2/64, frame 2's Motion
+
+    def test_motion_time_tracks_motion_packet(self):
+        files = self.record(F2026, {0: "Driver"},
+                            telemetry2={0: telemetry2_car(regs_2026=1)}, frames=2)
+        rows = next(iter(files.values()))
+        self.assertEqual([r["motion_time"] for r in rows], ["100.0312", "100.0469"])
 
     def test_2026_format_mixes_regs_per_car(self):
         files = self.record(F2026, {0: "Legacy", 23: "Modern"}, telemetry2={

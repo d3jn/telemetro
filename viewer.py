@@ -29,11 +29,13 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -44,6 +46,10 @@ from PySide6.QtWidgets import (
 
 from recorder import ROW_FIELDS
 
+# Columns the recorder added after the 2026 format change. Recordings made
+# before them still open; nothing in the viewer reads them yet.
+OPTIONAL_FIELDS = {"yaw", "motion_time"}
+REQUIRED_FIELDS = [c for c in ROW_FIELDS if c not in OPTIONAL_FIELDS]
 
 # ERS store capacity per regulation set, keyed by the CSV `regs` column. The
 # recorder writes raw Joules so this is the only place the capacity lives. The
@@ -53,6 +59,12 @@ ERS_STORE_MAX_J = {2025: 4_000_000.0, 2026: 4_000_000.0}
 # Aero panel lanes: each on/off signal is drawn in its own band so the two
 # never overlap. (off_y, on_y) per signal.
 AERO_LANES = {"low_drag": (0.0, 0.8), "overtake_active": (1.2, 2.0)}
+
+# Minimum chart height per unit of stack weight (see MainWindow): 60 px for the
+# thin Delta and Aero panels, 120 px for most, 180 px for Inputs. In a
+# maximised 1080p window six charts fit at their usual proportions; all nine
+# sit at these minimums and scroll by about 100 px.
+PANEL_HEIGHT_PER_WEIGHT = 60
 
 
 def _base_dir():
@@ -80,8 +92,10 @@ def _downsample_lap_df(lap_df, target_hz):
     bins every ``round(source_hz / target_hz)`` consecutive rows. Continuous
     columns are averaged (smoothing the trace); discrete columns (gear,
     ers_mode, lap_num, regs, aero flags) take the first value of each bin so
-    step renders and integer tooltips stay sensible. Pure in-memory — the
-    source CSV is not touched.
+    step renders and integer tooltips stay sensible. ``yaw`` takes the first
+    value too: it wraps at +/-pi, and a plain mean across the wrap would land
+    near 0, pointing the car the wrong way. Pure in-memory — the source CSV
+    is not touched.
     """
     if target_hz is None or target_hz <= 0:
         return lap_df
@@ -101,7 +115,7 @@ def _downsample_lap_df(lap_df, target_hz):
     bins = np.arange(len(lap_df)) // bin_size
     first_cols = (
         "gear", "ers_mode", "lap_num", "lap_run", "sector_idx",
-        "regs", "low_drag", "overtake_active",
+        "regs", "low_drag", "overtake_active", "yaw",
     )
     # sector1_time / sector2_time / last_lap_time are 0 then latched to a
     # game-stamped value; max() preserves the latch through bin boundaries
@@ -116,6 +130,38 @@ def _downsample_lap_df(lap_df, target_hz):
         else:
             agg[col] = "mean"
     return lap_df.groupby(bins).agg(agg)
+
+
+# Sign applied to d(yaw)/dt so the Yaw rate panel reads left turn = +, like the
+# Steer panel. Assumes m_yaw grows as the car turns left: the right-hand rule
+# about the up axis, in the world orientation the trajectory map's invertX
+# implies. Not yet checked against a recording; if yaw rate and Steer have
+# opposite signs through corners, flip this to -1.
+YAW_RATE_SIGN = 1
+
+
+def _yaw_rate_deg_s(yaw, motion_time):
+    """Per-row yaw rate in deg/s, NaN where it cannot be computed.
+
+    Rows are written per Car Telemetry packet, so consecutive rows can repeat
+    one Motion packet; differentiating those as-is would give 0 followed by a
+    doubled spike. So: keep one sample per distinct ``motion_time`` (which
+    also puts them in time order), unwrap ``yaw`` across the +/-pi seam, take
+    central differences against ``motion_time``, then give every row the rate
+    of the Motion packet it came from.
+    """
+    yaw = np.asarray(yaw, dtype=float)
+    t = np.asarray(motion_time, dtype=float)
+    rate = np.full(len(yaw), np.nan)
+    valid = np.isfinite(yaw) & np.isfinite(t)
+    t_u, first, inverse = np.unique(
+        t[valid], return_index=True, return_inverse=True
+    )
+    if len(t_u) < 2:
+        return rate
+    yaw_u = np.unwrap(yaw[valid][first])
+    rate[valid] = YAW_RATE_SIGN * np.degrees(np.gradient(yaw_u, t_u))[inverse]
+    return rate
 
 
 def _format_gear(v):
@@ -171,7 +217,7 @@ class SampleLoader(QWidget):
 
         try:
             df = pd.read_csv(path)
-            missing = [c for c in ROW_FIELDS if c not in df.columns]
+            missing = [c for c in REQUIRED_FIELDS if c not in df.columns]
             if missing:
                 raise ValueError(
                     "not a recording in the current format (older recorder "
@@ -468,6 +514,22 @@ class ChartPanel(QWidget):
         QToolTip.showText(QCursor.pos(), "\n".join(lines), self.plot_widget)
 
 
+class ChartScrollArea(QScrollArea):
+    """Scroll area for the chart stack that the mouse wheel never scrolls.
+
+    The wheel belongs to the charts: over a chart (axes and margins included)
+    it zooms X and the chart keeps the event. The only wheel events that
+    reach this widget are the ones the charts did not take, mostly from the
+    splitter handles between them, and scrolling on those would make a wheel
+    that lands a few pixels off a chart jump the stack instead of zooming.
+    Ignoring them leaves the scrollbar (drag, click, or wheel over the
+    scrollbar itself, which handles its own events) as the way to scroll.
+    """
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class StatsDialog(QDialog):
     """Modal table of per-sample lap statistics, recomputed on every open."""
 
@@ -544,10 +606,8 @@ class ChartsSettingsDialog(QDialog):
     """Modal dialog with a single "Charts" group of checkboxes — one per
     available chart panel. The caller passes the current visibility state
     and reads back the chosen state on accept(). At least one chart must
-    stay checked; up to ``MAX_SELECTED`` may be checked (the cap is here
-    in anticipation of more panels — with 6 it's unreachable today)."""
-
-    MAX_SELECTED = 6
+    stay checked; any number may be — the chart stack scrolls once they no
+    longer fit."""
 
     def __init__(self, chart_specs, current_state, parent=None):
         """``chart_specs`` is an ordered list of ``(key, label)`` tuples.
@@ -584,14 +644,10 @@ class ChartsSettingsDialog(QDialog):
 
     def _refresh_constraints(self, *_):
         checked = [cb for cb in self._checkboxes.values() if cb.isChecked()]
-        unchecked = [cb for cb in self._checkboxes.values() if not cb.isChecked()]
         for cb in self._checkboxes.values():
             cb.setEnabled(True)
         if len(checked) == 1:
             checked[0].setEnabled(False)  # can't deselect the last one
-        if len(checked) >= self.MAX_SELECTED:
-            for cb in unchecked:
-                cb.setEnabled(False)  # cap on total selected
 
     def get_state(self):
         return {key: cb.isChecked() for key, cb in self._checkboxes.items()}
@@ -666,6 +722,11 @@ class MainWindow(QMainWindow):
             y_range=(-110, 110),
             y_ticks=[(v, str(v)) for v in (-100, -50, 0, 50, 100)],
         )
+        # Symmetric about 0, left turn = + like Steer.
+        self.yaw_rate_panel = ChartPanel(
+            y_label="Yaw rate (°/s)",
+            y_range=(-90, 90),  # placeholder; set per-render from data
+        )
         self.ers_panel = ChartPanel(
             y_label="ERS",
             y_range=(0, 110),
@@ -689,27 +750,46 @@ class MainWindow(QMainWindow):
         self.speed_panel.link_x_to(self.input_panel)
         self.gear_panel.link_x_to(self.input_panel)
         self.steering_panel.link_x_to(self.input_panel)
+        self.yaw_rate_panel.link_x_to(self.input_panel)
         self.ers_panel.link_x_to(self.input_panel)
         self.fuel_panel.link_x_to(self.input_panel)
         self.aero_panel.link_x_to(self.input_panel)
 
+        # Top-to-bottom order, each with a weight: the panel's share of the
+        # stack's height, and its minimum height in PANEL_HEIGHT_PER_WEIGHT
+        # units. While every visible panel fits, they split the height by
+        # weight as before; once they would shrink below their minimums the
+        # stack stops shrinking and the scroll area takes over.
+        stack = (
+            (self.delta_panel, 1),
+            (self.input_panel, 3),
+            (self.speed_panel, 2),
+            (self.gear_panel, 2),
+            (self.steering_panel, 2),
+            (self.yaw_rate_panel, 2),
+            (self.ers_panel, 2),
+            (self.fuel_panel, 2),
+            (self.aero_panel, 1),
+        )
         chart_stack = QSplitter(Qt.Orientation.Vertical)
-        chart_stack.addWidget(self.delta_panel)
-        chart_stack.addWidget(self.input_panel)
-        chart_stack.addWidget(self.speed_panel)
-        chart_stack.addWidget(self.gear_panel)
-        chart_stack.addWidget(self.steering_panel)
-        chart_stack.addWidget(self.ers_panel)
-        chart_stack.addWidget(self.fuel_panel)
-        chart_stack.addWidget(self.aero_panel)
-        chart_stack.setStretchFactor(0, 1)
-        chart_stack.setStretchFactor(1, 3)
-        chart_stack.setStretchFactor(2, 2)
-        chart_stack.setStretchFactor(3, 2)
-        chart_stack.setStretchFactor(4, 2)
-        chart_stack.setStretchFactor(5, 2)
-        chart_stack.setStretchFactor(6, 2)
-        chart_stack.setStretchFactor(7, 1)
+        for i, (panel, weight) in enumerate(stack):
+            chart_stack.addWidget(panel)
+            chart_stack.setStretchFactor(i, weight)
+            panel.setMinimumHeight(weight * PANEL_HEIGHT_PER_WEIGHT)
+
+        # Vertical scrolling only: the panels always take the full width.
+        # widgetResizable lets the splitter grow to fill the viewport and
+        # stop at its children's minimum heights, which is what makes the
+        # scrollbar appear exactly when the visible panels stop fitting.
+        # The wheel zooms charts and never scrolls; see ChartScrollArea.
+        chart_scroll = ChartScrollArea()
+        chart_scroll.setWidgetResizable(True)
+        chart_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        chart_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        chart_scroll.setWidget(chart_stack)
+        self.chart_scroll = chart_scroll
 
         # Trajectory: free pan/zoom, square aspect ratio so the track isn't
         # distorted. Deliberately not part of the linked X group on the left.
@@ -724,21 +804,21 @@ class MainWindow(QMainWindow):
         traj_vb.invertX(True)
 
         main_split = QSplitter(Qt.Orientation.Horizontal)
-        main_split.addWidget(chart_stack)
+        main_split.addWidget(chart_scroll)
         main_split.addWidget(self.trajectory_plot)
         main_split.setStretchFactor(0, 2)
         main_split.setStretchFactor(1, 1)
         root.addWidget(main_split, 1)
 
-        # Ordered (key, label) specs drive the Settings dialog and the
-        # X-label bottom-most-visible lookup. Order here also matches the
-        # splitter, so keep them in sync.
+        # Ordered (key, label) specs drive the Settings dialog. Order here
+        # matches the splitter, so keep them in sync.
         self._chart_specs = [
             ("delta", "Delta"),
             ("inputs", "Inputs"),
             ("speed", "Speed"),
             ("gear", "Gear"),
             ("steering", "Steering"),
+            ("yaw_rate", "Yaw rate"),
             ("ers", "ERS"),
             ("fuel", "Fuel"),
             ("aero", "Aero"),
@@ -749,21 +829,22 @@ class MainWindow(QMainWindow):
             "speed": self.speed_panel,
             "gear": self.gear_panel,
             "steering": self.steering_panel,
+            "yaw_rate": self.yaw_rate_panel,
             "ers": self.ers_panel,
             "fuel": self.fuel_panel,
             "aero": self.aero_panel,
         }
-        # All on by default except fuel and aero — keeps the historical layout
-        # intact for users who don't care about them.
+        # Every chart on by default; the stack scrolls when they don't fit.
         self._chart_visibility = {key: True for key, _ in self._chart_specs}
-        for key in ("fuel", "aero"):
-            self._chart_visibility[key] = False
-            self._chart_panels[key].setVisible(False)
-        # Whether the last _on_render actually produced delta data. The
-        # delta panel is shown only when the user wants it AND this is True.
+        # Whether the last _on_render actually produced delta / yaw rate data.
+        # Each of those panels is shown only when the user wants it AND its
+        # flag is True.
         self._delta_renderable = False
+        self._yaw_rate_renderable = False
 
+        # Hidden until a render gives them data.
         self.delta_panel.setVisible(False)
+        self.yaw_rate_panel.setVisible(False)
 
         # Trajectory markers — solid filled circles, 2× the trajectory line
         # width (3px) → 6px diameter. pxMode=True keeps them screen-pixel
@@ -786,16 +867,7 @@ class MainWindow(QMainWindow):
             marker.setVisible(False)
             self.trajectory_item.addItem(marker)
 
-        self._left_panels = (
-            self.delta_panel,
-            self.input_panel,
-            self.speed_panel,
-            self.gear_panel,
-            self.steering_panel,
-            self.ers_panel,
-            self.fuel_panel,
-            self.aero_panel,
-        )
+        self._left_panels = tuple(panel for panel, _ in stack)
         for panel in self._left_panels:
             panel.x_hovered.connect(self._on_chart_x_hovered)
             panel.x_unhovered.connect(self._on_chart_x_unhovered)
@@ -821,6 +893,9 @@ class MainWindow(QMainWindow):
                 # Delta has the data-side gate: it only makes sense when both
                 # samples are loaded and a delta curve was actually computed.
                 panel.setVisible(wanted and self._delta_renderable)
+            elif key == "yaw_rate":
+                # Recordings made before yaw was recorded have nothing to show.
+                panel.setVisible(wanted and self._yaw_rate_renderable)
             else:
                 panel.setVisible(wanted)
         self._update_x_label()
@@ -886,10 +961,14 @@ class MainWindow(QMainWindow):
         Raw ``lap_time`` ships in the LAP packet, separate from CarTelemetry,
         so UDP can deliver the two streams out of order — adjacent rows show
         jitter of ±50-200 ms and occasional backward jumps. Integrating
-        ``lap_distance`` against ``speed`` (both from the same CarTelemetry
-        packet) produces a self-consistent monotonic curve. The anchor is
-        the first sample's reported ``lap_time``, preserving absolute time
-        since the lap-start line (modulo one tiny error at row 0).
+        ``speed`` (CarTelemetry) over ``lap_distance`` (LAP) gives a curve
+        that is monotonic by construction: ``x`` arrives sorted and speed is
+        floored at 0.5 m/s. The two still come from different packets, so a
+        row's speed can be a frame off its lap_distance; speed changes by ~1%
+        per frame even under hard braking, so that error stays small. The
+        anchor is the first sample's reported ``lap_time``, preserving
+        absolute time since the lap-start line (modulo one tiny error at
+        row 0).
         """
         if len(x) < 2:
             return np.array([anchor_ms], dtype=float)
@@ -987,6 +1066,14 @@ class MainWindow(QMainWindow):
         lap_df = lap_df.sort_values("lap_distance")
         if lap_df.empty:
             return None
+        # Before downsampling: the rate needs each Motion packet's own
+        # timestamp, which block-averaging would blur. Downsampling then
+        # averages the rate like any other continuous column.
+        if "yaw" in lap_df.columns and "motion_time" in lap_df.columns:
+            yaw_rate = _yaw_rate_deg_s(lap_df["yaw"], lap_df["motion_time"])
+        else:
+            yaw_rate = np.nan  # recorded before yaw was
+        lap_df = lap_df.assign(yaw_rate=yaw_rate)
         lap_df = _downsample_lap_df(lap_df, self._downsample_hz)
         return {
             "x": lap_df["lap_distance"].to_numpy(),
@@ -1007,6 +1094,9 @@ class MainWindow(QMainWindow):
             # F1 25 reports steer as positive-right / negative-left. Flip
             # the sign so the panel reads left=+ and right=- as requested.
             "steer": -lap_df["steer"].to_numpy(),
+            # deg/s, left turn = + to match steer. All NaN for recordings
+            # made before yaw was recorded.
+            "yaw_rate": lap_df["yaw_rate"].to_numpy(dtype=float),
             "world_x": lap_df["world_x"].to_numpy(),
             "world_z": lap_df["world_z"].to_numpy(),
             "sector_idx": lap_df["sector_idx"].to_numpy(),
@@ -1098,6 +1188,7 @@ class MainWindow(QMainWindow):
         self.speed_panel.clear()
         self.gear_panel.clear()
         self.steering_panel.clear()
+        self.yaw_rate_panel.clear()
         self.ers_panel.clear()
         self.fuel_panel.clear()
         self.aero_panel.clear()
@@ -1128,6 +1219,10 @@ class MainWindow(QMainWindow):
         steering_pens = {
             1: pg.mkPen((160, 32, 240), width=3),
             2: pg.mkPen((210, 160, 240), width=3, style=Qt.PenStyle.DashLine),
+        }
+        yaw_rate_pens = {
+            1: pg.mkPen((139, 69, 19), width=3),
+            2: pg.mkPen((210, 170, 130), width=3, style=Qt.PenStyle.DashLine),
         }
         fuel_pens = {
             1: pg.mkPen((218, 165, 32), width=3),
@@ -1198,6 +1293,19 @@ class MainWindow(QMainWindow):
                 label="Steer",
                 sample_num=sample_num,
             )
+            # NaN rows (before the first Motion packet, or a whole recording
+            # without yaw) are left out rather than plotted.
+            yaw_rate = data["yaw_rate"]
+            finite = np.isfinite(yaw_rate)
+            if finite.any():
+                self.yaw_rate_panel.add_series(
+                    data["x"][finite],
+                    yaw_rate[finite],
+                    pen=yaw_rate_pens[sample_num],
+                    label="Yaw rate",
+                    sample_num=sample_num,
+                    formatter=lambda v: f"{v:+.1f}°/s",
+                )
             self.fuel_panel.add_series(
                 data["x"],
                 data["fuel_used"],
@@ -1230,6 +1338,18 @@ class MainWindow(QMainWindow):
             self.trajectory_item.addItem(marker)
 
         self._delta_renderable = False
+
+        # Symmetric range so 0 (driving straight) sits mid-panel.
+        yaw_rates = [
+            d["yaw_rate"][np.isfinite(d["yaw_rate"])]
+            for d in self._samples.values()
+            if d is not None
+        ]
+        yaw_rates = [r for r in yaw_rates if len(r)]
+        self._yaw_rate_renderable = bool(yaw_rates)
+        if yaw_rates:
+            y_lim = max(max(float(np.max(np.abs(r))) for r in yaw_rates), 1.0) * 1.1
+            self.yaw_rate_panel.set_y_range(-y_lim, y_lim)
 
         xs = [d["x"] for d in self._samples.values() if d is not None]
         if xs:

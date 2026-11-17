@@ -73,9 +73,17 @@ whichever UDP format was recorded, and cover both regulation sets:
   percentage using the store capacity for the car's `regs`.
 - `ers_mode` — raw deploy mode: 0 none, 1 medium, 2 hotlap, 3 boost (the
   2025 spec calls mode 3 "overtake").
+- `yaw` — heading in radians, wrapping at ±π.
+- `motion_time` — session time in seconds of the Motion packet that
+  `world_x`, `world_z` and `yaw` came from. For yaw rate, unwrap `yaw`, drop
+  rows that repeat a `motion_time`, and differentiate against `motion_time`
+  rather than `lap_time`, which comes from a different packet. The viewer's
+  Yaw rate chart does exactly this; it stays hidden for recordings made
+  before yaw was recorded.
 
 Recordings from older recorder builds (before 2026 support) cannot be
-opened in the viewer. If the recorder finds an old-format file with the
+opened in the viewer. Recordings made before `yaw` and `motion_time` were
+added still open. If the recorder finds an old-format file with the
 same name, it renames it to `*.legacy_<timestamp>.csv` and starts a new file.
 
 ## Tests

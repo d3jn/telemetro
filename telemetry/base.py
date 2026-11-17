@@ -53,7 +53,7 @@ class TelemetryFormat:
 
     Payload shapes, all plain dicts:
 
-      KIND_MOTION          list of num_cars {world_x, world_z}
+      KIND_MOTION          list of num_cars {world_x, world_z, yaw}
       KIND_SESSION         {session_type, session_type_code, track_id, track_name}
       KIND_LAP             list of num_cars {last_lap_time_ms, lap_time_ms,
                            sector1_time_ms, sector2_time_ms, lap_distance,
@@ -174,7 +174,9 @@ class TelemetryFormat:
         cars = self._unpack_cars(data, self.car_motion)
         if cars is None:
             return None
-        return [{"world_x": m[0], "world_z": m[2]} for m in cars]
+        # m_yaw is in radians, wrapping at +/-pi. Index 15 in both the 2025 and
+        # 2026 layouts.
+        return [{"world_x": m[0], "world_z": m[2], "yaw": m[15]} for m in cars]
 
     def _parse_car_telemetry(self, data):
         cars = self._unpack_cars(data, self.car_telemetry)
