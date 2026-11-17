@@ -30,6 +30,10 @@ covers both regulation sets:
                      differentiate yaw against motion_time after dropping
                      repeated motion_time values, not against lap_time, which
                      comes from the Lap packet.
+    lap_packet_time  Session time in seconds of the Lap packet that lap_num,
+                     lap_distance, lap_time and the sector fields came from.
+                     The viewer's delta pairs it with lap_distance, so each
+                     (time, position) pair is one moment.
 """
 
 import csv
@@ -73,6 +77,7 @@ ROW_FIELDS = [
     "motion_time",
     "lap_time",
     "lap_distance",
+    "lap_packet_time",
     "last_lap_time",
     "sector1_time",
     "sector2_time",
@@ -145,6 +150,7 @@ class Recorder:
         self._motion = [None] * num_cars
         self._motion_time = None        # header session_time of self._motion
         self._lap = [None] * num_cars
+        self._lap_packet_time = None    # header session_time of self._lap
         self._status = [None] * num_cars
         self._damage = [None] * num_cars
         self._telemetry2 = [None] * num_cars
@@ -226,6 +232,7 @@ class Recorder:
     def on_lap(self, header, samples):
         if self._fresh("lap", header):
             self._lap = samples
+            self._lap_packet_time = header["session_time"]
 
     def on_car_status(self, header, samples):
         if self._fresh("status", header):
@@ -413,6 +420,8 @@ class Recorder:
                 "motion_time": f"{self._motion_time:.4f}" if motion else "",
                 "lap_time": lap["lap_time_ms"] if lap else "",
                 "lap_distance": f"{lap['lap_distance']:.2f}" if lap else "",
+                # 4 decimals for the same reason as motion_time.
+                "lap_packet_time": f"{self._lap_packet_time:.4f}" if lap else "",
                 "last_lap_time": lap["last_lap_time_ms"] if lap else "",
                 "sector1_time": lap["sector1_time_ms"] if lap else "",
                 "sector2_time": lap["sector2_time_ms"] if lap else "",

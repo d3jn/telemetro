@@ -48,7 +48,7 @@ from recorder import ROW_FIELDS
 
 # Columns the recorder added after the 2026 format change. Recordings made
 # before them still open; nothing in the viewer reads them yet.
-OPTIONAL_FIELDS = {"yaw", "motion_time"}
+OPTIONAL_FIELDS = {"yaw", "motion_time", "lap_packet_time"}
 REQUIRED_FIELDS = [c for c in ROW_FIELDS if c not in OPTIONAL_FIELDS]
 
 # ERS store capacity per regulation set, keyed by the CSV `regs` column. The
@@ -162,6 +162,55 @@ def _yaw_rate_deg_s(yaw, motion_time):
     yaw_u = np.unwrap(yaw[valid][first])
     rate[valid] = YAW_RATE_SIGN * np.degrees(np.gradient(yaw_u, t_u))[inverse]
     return rate
+
+
+def _time_at_distance(lap_distance, clock_s):
+    """One lap's (distance, time) pairs, both strictly increasing, for looking
+    up when the car first reached each point of the lap.
+
+    ``clock_s`` must come from the same packet as ``lap_distance``, so that
+    each pair is one moment. Rows are written per Car Telemetry packet, so
+    several can repeat one Lap packet: keep one row per clock value, which
+    also puts them in time order. Then keep only rows that set a new furthest
+    distance. After a spin or a reverse the clock runs on while the distance
+    falls back, so the time lost lands where the car gets past its furthest
+    point again.
+    """
+    d = np.asarray(lap_distance, dtype=float)
+    t = np.asarray(clock_s, dtype=float)
+    valid = np.isfinite(d) & np.isfinite(t)
+    t_u, first = np.unique(t[valid], return_index=True)
+    d_u = d[valid][first]
+    if len(d_u) == 0:
+        return d_u, t_u
+    furthest_before = np.maximum.accumulate(np.concatenate(([-np.inf], d_u[:-1])))
+    keep = d_u > furthest_before
+    return d_u[keep], t_u[keep]
+
+
+def _lap_delta_s(d1, t1, d2, t2):
+    """Time delta of lap 1 against lap 2 in seconds; + means lap 1 is behind.
+
+    Takes two laps' ``_time_at_distance`` pairs. Over the distance both laps
+    cover, it is the time each took from the start of that shared stretch to
+    every point, lap 1 minus lap 2. For two full laps the stretch starts
+    within a metre or so of the line, so this is time lost or gained since
+    the line. A lap whose data starts mid-lap (recording started late, or a
+    run after a flashback) is compared from where both laps have data.
+
+    Returns ``(distance, delta)`` sampled at lap 1's rows plus both ends of
+    the shared stretch, or None when the laps share no stretch.
+    """
+    if len(d1) < 2 or len(d2) < 2:
+        return None
+    lo = max(d1[0], d2[0])
+    hi = min(d1[-1], d2[-1])
+    if hi <= lo:
+        return None
+    x = np.unique(np.concatenate(([lo], d1[(d1 > lo) & (d1 < hi)], [hi])))
+    elapsed1 = np.interp(x, d1, t1) - np.interp(lo, d1, t1)
+    elapsed2 = np.interp(x, d2, t2) - np.interp(lo, d2, t2)
+    return x, elapsed1 - elapsed2
 
 
 def _format_gear(v):
@@ -953,103 +1002,12 @@ class MainWindow(QMainWindow):
         for marker in self.trajectory_markers.values():
             marker.setVisible(False)
 
-    @staticmethod
-    def _smooth_elapsed_time_ms(x, speed_kmh, anchor_ms):
-        """Reconstruct a smooth elapsed-time-at-distance curve by integrating
-        speed.
-
-        Raw ``lap_time`` ships in the LAP packet, separate from CarTelemetry,
-        so UDP can deliver the two streams out of order — adjacent rows show
-        jitter of ±50-200 ms and occasional backward jumps. Integrating
-        ``speed`` (CarTelemetry) over ``lap_distance`` (LAP) gives a curve
-        that is monotonic by construction: ``x`` arrives sorted and speed is
-        floored at 0.5 m/s. The two still come from different packets, so a
-        row's speed can be a frame off its lap_distance; speed changes by ~1%
-        per frame even under hard braking, so that error stays small. The
-        anchor is the first sample's reported ``lap_time``, preserving
-        absolute time since the lap-start line (modulo one tiny error at
-        row 0).
-        """
-        if len(x) < 2:
-            return np.array([anchor_ms], dtype=float)
-        speed_ms = np.maximum(speed_kmh.astype(float) / 3.6, 0.5)
-        avg_speed = (speed_ms[:-1] + speed_ms[1:]) / 2
-        dt_ms = np.diff(x) / avg_speed * 1000.0
-        return anchor_ms + np.concatenate([[0.0], np.cumsum(dt_ms)])
-
-    @staticmethod
-    def _calibrated_elapsed_time_ms(data):
-        """Piecewise-linear calibration of speed-integrated time against the
-        game's sector and lap-total stamps.
-
-        Anchors (when available): t(S1 boundary) = sector1_time,
-        t(S2 boundary) = sector1_time + sector2_time, t(last row) =
-        lap_total_ms. Between anchors, the relative integration is stretched
-        linearly so its endpoints match — the SHAPE within each segment is
-        preserved (which is what tells you where on track time was gained
-        or lost) while the absolute level matches the game's authoritative
-        stamps. Sector 1 with no start-of-lap anchor gets a pure shift; if
-        any anchor is unavailable (incomplete lap, no boundary crossed),
-        the corresponding segment falls back to the previous segment's
-        anchor + raw integration.
-        """
-        x = data["x"]
-        speed = data["speed"]
-        sector_idx = data["sector_idx"].astype(int)
-        s1_ms = data.get("sector1_time_ms") or 0.0
-        s2_ms = data.get("sector2_time_ms") or 0.0
-        total_ms = data.get("lap_total_ms")
-
-        t_rel = MainWindow._smooth_elapsed_time_ms(x, speed, 0.0)
-        t = t_rel.copy()
-        n = len(t)
-        if n == 0:
-            return t
-
-        in_s2 = sector_idx >= 1
-        in_s3 = sector_idx >= 2
-        i_s1 = int(np.argmax(in_s2)) if in_s2.any() else -1
-        i_s2 = int(np.argmax(in_s3)) if in_s3.any() else -1
-
-        # Sector 1: pure shift (no lap-start anchor; data may begin mid-sector).
-        if i_s1 > 0 and s1_ms > 0:
-            shift = s1_ms - t_rel[i_s1]
-            t[: i_s1 + 1] = t_rel[: i_s1 + 1] + shift
-
-        # Sector 2: piecewise linear stretch between S1 and S2 anchors.
-        if i_s1 >= 0 and i_s2 > i_s1 and s1_ms > 0 and s2_ms > 0:
-            rel_lo = t_rel[i_s1]
-            rel_hi = t_rel[i_s2]
-            if rel_hi > rel_lo:
-                scale = s2_ms / (rel_hi - rel_lo)
-                t[i_s1 + 1 : i_s2 + 1] = (
-                    s1_ms + (t_rel[i_s1 + 1 : i_s2 + 1] - rel_lo) * scale
-                )
-
-        # Sector 3: piecewise linear stretch between S2 anchor and lap end.
-        if (
-            i_s2 > 0
-            and total_ms is not None
-            and s1_ms > 0
-            and s2_ms > 0
-        ):
-            s3_ms = total_ms - s1_ms - s2_ms
-            rel_lo = t_rel[i_s2]
-            rel_hi = t_rel[-1]
-            if rel_hi > rel_lo and s3_ms > 0:
-                scale = s3_ms / (rel_hi - rel_lo)
-                t[i_s2 + 1 :] = (
-                    (s1_ms + s2_ms) + (t_rel[i_s2 + 1 :] - rel_lo) * scale
-                )
-
-        return t
-
     def _extract_lap(self, sample):
         df = sample._df
         selection = sample.lap_combo.currentData()
         if df is None or selection is None:
             return None
-        lap, lap_run, lap_total_ms = selection
+        lap, lap_run, _lap_total_ms = selection
         lap_df = df[df["lap_num"] == lap]
         if lap_run is not None and "lap_run" in df.columns:
             lap_df = lap_df[lap_df["lap_run"] == lap_run]
@@ -1074,6 +1032,19 @@ class MainWindow(QMainWindow):
         else:
             yaw_rate = np.nan  # recorded before yaw was
         lap_df = lap_df.assign(yaw_rate=yaw_rate)
+        # Delta also works on every row: it compares measured times, and
+        # averaging them in bins would only blur where time was gained. The
+        # clock must come from the Lap packet, like lap_distance.
+        if (
+            "lap_packet_time" in lap_df.columns
+            and lap_df["lap_packet_time"].notna().any()
+        ):
+            clock_s = lap_df["lap_packet_time"]
+        else:
+            # Recorded before lap_packet_time: fall back to the game's
+            # current lap time, which is in the same Lap packet too.
+            clock_s = lap_df["lap_time"] / 1000.0
+        time_at_distance = _time_at_distance(lap_df["lap_distance"], clock_s)
         lap_df = _downsample_lap_df(lap_df, self._downsample_hz)
         return {
             "x": lap_df["lap_distance"].to_numpy(),
@@ -1099,15 +1070,9 @@ class MainWindow(QMainWindow):
             "yaw_rate": lap_df["yaw_rate"].to_numpy(dtype=float),
             "world_x": lap_df["world_x"].to_numpy(),
             "world_z": lap_df["world_z"].to_numpy(),
-            "sector_idx": lap_df["sector_idx"].to_numpy(),
-            # sector1_time / sector2_time are 0 until the corresponding
-            # boundary is crossed, then latched to the game-stamped value.
-            # max() picks the latched value (or stays 0 if never crossed).
-            "sector1_time_ms": float(lap_df["sector1_time"].max() or 0),
-            "sector2_time_ms": float(lap_df["sector2_time"].max() or 0),
-            # Game-authoritative total from the next block's last_lap_time;
-            # None when the recording ended before the line crossing.
-            "lap_total_ms": float(lap_total_ms) if lap_total_ms else None,
+            # (distance, time) pairs from every row, not downsampled; see
+            # _time_at_distance. Used only for the delta.
+            "time_at_distance": time_at_distance,
             # Cumulative fuel consumed since the first row of this lap. Uses
             # the first row's fuel_level as the baseline so the chart starts
             # at 0 even when the sample is missing rows near lap_distance=0.
@@ -1376,33 +1341,22 @@ class MainWindow(QMainWindow):
         s1 = self._samples[1]
         s2 = self._samples[2]
         if s1 is not None and s2 is not None:
-            delta_x_min = max(float(s1["x"].min()), float(s2["x"].min()))
-            delta_x_max = min(float(s1["x"].max()), float(s2["x"].max()))
-            if delta_x_max > delta_x_min:
-                # Calibrated delta — see _calibrated_elapsed_time_ms.
-                t1_full = self._calibrated_elapsed_time_ms(s1)
-                t2_full = self._calibrated_elapsed_time_ms(s2)
-
-                mask = (s1["x"] >= delta_x_min) & (s1["x"] <= delta_x_max)
-                x_common = s1["x"][mask]
-                if len(x_common) >= 2:
-                    t1 = t1_full[mask]
-                    t2 = np.interp(x_common, s2["x"], t2_full)
-                    delta_s = (t1 - t2) / 1000.0
-
-                    max_abs = float(np.max(np.abs(delta_s)))
-                    if max_abs == 0:
-                        max_abs = 0.001
-                    y_lim = max_abs * 1.1
-                    self.delta_panel.set_y_range(-y_lim, y_lim)
-                    self.delta_panel.add_series(
-                        x_common,
-                        delta_s,
-                        pen=pg.mkPen("b", width=3),
-                        label="Δ",
-                        formatter=lambda v: f"{v:+.3f}s",
-                    )
-                    self._delta_renderable = True
+            delta = _lap_delta_s(*s1["time_at_distance"], *s2["time_at_distance"])
+            if delta is not None:
+                x_common, delta_s = delta
+                max_abs = float(np.max(np.abs(delta_s)))
+                if max_abs == 0:
+                    max_abs = 0.001
+                y_lim = max_abs * 1.1
+                self.delta_panel.set_y_range(-y_lim, y_lim)
+                self.delta_panel.add_series(
+                    x_common,
+                    delta_s,
+                    pen=pg.mkPen("b", width=3),
+                    label="Δ",
+                    formatter=lambda v: f"{v:+.3f}s",
+                )
+                self._delta_renderable = True
 
         self._update_panel_visibility()
 

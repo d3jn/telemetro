@@ -4,9 +4,8 @@ since importing viewer pulls in PySide6 and pyqtgraph."""
 import math
 import unittest
 
-import numpy as np
-
 try:
+    import numpy as np
     import viewer
 except ImportError:  # pragma: no cover - depends on the environment
     viewer = None
@@ -59,6 +58,65 @@ class YawRateTest(unittest.TestCase):
     def test_one_motion_packet_is_not_enough(self):
         rate = viewer._yaw_rate_deg_s([0.1, 0.1, 0.1], [5.0, 5.0, 5.0])
         self.assertTrue(np.isnan(rate).all())
+
+
+def constant_speed_lap(speed, start_s, d_from=0.0, d_to=1000.0, hz=60, repeat_every=3):
+    """Rows of a lap driven at ``speed`` m/s whose clock reads ``start_s`` at
+    ``d_from``. Every ``repeat_every``-th Lap packet is written on two rows,
+    and rows come sorted by distance, as _extract_lap hands them over."""
+    n = int((d_to - d_from) / speed * hz) + 1
+    t = start_s + np.arange(n) / hz
+    d = d_from + speed * (t - start_s)
+    rows = np.repeat(np.arange(n), np.where(np.arange(n) % repeat_every == 0, 2, 1))
+    return d[rows], t[rows]
+
+
+@unittest.skipIf(viewer is None, "viewer needs PySide6, pandas and pyqtgraph")
+class TimeAtDistanceTest(unittest.TestCase):
+    def test_repeated_rows_collapse_to_one_per_packet(self):
+        d, t = constant_speed_lap(50.0, 300.0, d_to=100.0)
+        dd, tt = viewer._time_at_distance(d, t)
+        self.assertEqual(len(tt), len(np.unique(t)))
+        self.assertTrue((np.diff(dd) > 0).all() and (np.diff(tt) > 0).all())
+
+    def test_time_lost_backwards_lands_where_the_car_passes_its_furthest_point(self):
+        # Reaches 30 m at t=3, rolls back to 20 m, regains 30 m at t=8.
+        d = [0, 10, 20, 30, 25, 20, 25, 30, 35, 40]
+        t = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        dd, tt = viewer._time_at_distance(d, t)
+        np.testing.assert_array_equal(dd, [0, 10, 20, 30, 35, 40])
+        np.testing.assert_array_equal(tt, [0, 1, 2, 3, 8, 9])
+
+    def test_rows_without_a_clock_are_dropped(self):
+        dd, tt = viewer._time_at_distance([0, 10, 20], [np.nan, 1.0, 2.0])
+        np.testing.assert_array_equal(dd, [10, 20])
+
+
+@unittest.skipIf(viewer is None, "viewer needs PySide6, pandas and pyqtgraph")
+class LapDeltaTest(unittest.TestCase):
+    def test_full_laps_on_different_session_clocks(self):
+        # Lap 1 at 50 m/s, lap 2 at 40 m/s, recorded 900 s apart in session
+        # time: lap 1 gains 1/40 - 1/50 s per metre, 5 s over 1000 m.
+        lap1 = viewer._time_at_distance(*constant_speed_lap(50.0, 312.25))
+        lap2 = viewer._time_at_distance(*constant_speed_lap(40.0, 1212.5))
+        x, delta = viewer._lap_delta_s(*lap1, *lap2)
+        self.assertEqual(x[0], 0.0)
+        self.assertAlmostEqual(delta[0], 0.0)
+        np.testing.assert_allclose(delta, x / 50.0 - x / 40.0, atol=1e-9)
+        self.assertAlmostEqual(delta[-1], 1000 / 50 - 1000 / 40, delta=0.02)
+
+    def test_lap_starting_mid_lap_is_compared_from_where_both_have_data(self):
+        lap1 = viewer._time_at_distance(*constant_speed_lap(50.0, 10.0))
+        lap2 = viewer._time_at_distance(*constant_speed_lap(40.0, 50.0, d_from=300.0))
+        x, delta = viewer._lap_delta_s(*lap1, *lap2)
+        self.assertAlmostEqual(x[0], 300.0)
+        self.assertAlmostEqual(delta[0], 0.0)
+        np.testing.assert_allclose(delta, (x - 300) / 50.0 - (x - 300) / 40.0, atol=1e-9)
+
+    def test_no_shared_stretch(self):
+        lap1 = viewer._time_at_distance(*constant_speed_lap(50.0, 0.0, d_to=400.0))
+        lap2 = viewer._time_at_distance(*constant_speed_lap(50.0, 0.0, d_from=500.0))
+        self.assertIsNone(viewer._lap_delta_s(*lap1, *lap2))
 
 
 if __name__ == "__main__":

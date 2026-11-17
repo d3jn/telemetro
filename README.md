@@ -80,11 +80,17 @@ whichever UDP format was recorded, and cover both regulation sets:
   rather than `lap_time`, which comes from a different packet. The viewer's
   Yaw rate chart does exactly this; it stays hidden for recordings made
   before yaw was recorded.
+- `lap_packet_time` — session time in seconds of the Lap packet that
+  `lap_distance`, `lap_time` and the other lap fields came from. The viewer's
+  Delta chart compares two laps by when each first reached every
+  `lap_distance`, timed by this clock; recordings without it fall back to
+  `lap_time`, which comes from the same packet but only has 1 ms resolution.
 
 Recordings from older recorder builds (before 2026 support) cannot be
-opened in the viewer. Recordings made before `yaw` and `motion_time` were
-added still open. If the recorder finds an old-format file with the
-same name, it renames it to `*.legacy_<timestamp>.csv` and starts a new file.
+opened in the viewer. Recordings made before `yaw`, `motion_time` and
+`lap_packet_time` were added still open. If the recorder finds an
+old-format file with the same name, it renames it to
+`*.legacy_<timestamp>.csv` and starts a new file.
 
 ## Tests
 
@@ -92,7 +98,8 @@ same name, it renames it to `*.legacy_<timestamp>.csv` and starts a new file.
 python3 -m unittest discover -t . -s tests -v
 ```
 
-The parser and recorder tests use only the standard library.
+The parser and recorder tests use only the standard library; the viewer
+tests are skipped when PySide6, pandas or pyqtgraph is missing.
 
 ## Building Windows executables
 
